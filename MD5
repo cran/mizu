@@ -1,0 +1,16 @@
+8692b477f1d4f738467a03939a22f406 *DESCRIPTION
+35b1da9d828a5f1d8d4089531ea5fbcd *LICENSE
+375f92e38a924a6e78fe75355762593d *NAMESPACE
+8e9bfe85c04a5efbc6e5c051bdb849b7 *NEWS.md
+ea26a53a86e578a92af9e89f4267e96e *R/channel.R
+dfa223dc54016760c93c218ee5c6af18 *README.md
+ea8e19e95fbf5ceac0ed9d71b13ede20 *man/mizu_full.Rd
+7c52ca932e1ddcbd0c1359fa8629b0c4 *man/mizu_inproc_channel.Rd
+8e3f3e6fdb9319480efee5f5167952cf *man/mizu_inproc_close.Rd
+bf962e0ab1b48825c97a90c16caae7c1 *man/mizu_is_sentinel.Rd
+a39e670e823b12229537461e5aae1fbc *man/mizu_send.Rd
+ed0de2c1f38fefd33af32038e064b433 *man/print.mizu_inproc_channel.Rd
+640715eb7d08dea64c39a0be4e36f7e0 *src/channel.c
+d3be0835db4967d484b9122670520b0e *tests/testthat.R
+31ace2472280cb0276437bdbb4d6c913 *tests/testthat/_snaps/channel.md
+5de62f2360d1cf24e73d7c0b16d7d5f5 *tests/testthat/test-channel.R
