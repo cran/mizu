@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.19">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Benchmarks</title>
+<style>
+
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+width: 0.8em;
+margin: 0 0.8em 0.2em -1em;  vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+}
+pre.numberSource { margin-left: 3em; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+</style>
+</head>
+
+<body>
+
+
+<header id="title-block-header">
+<h1 class="title">Benchmarks</h1>
+
+</header>
+
+<nav id="TOC" role="doc-toc">
+    <h2 id="toc-title">Table of contents</h2>
+   
+  <ul>
+  <li><a href="#a-data-frame-round-trip" id="toc-a-data-frame-round-trip">A data frame round trip</a></li>
+  <li><a href="#five-thousand-small-tasks" id="toc-five-thousand-small-tasks">Five thousand small tasks</a></li>
+  <li><a href="#how-mizu-compares" id="toc-how-mizu-compares">How mizu compares</a>
+  <ul>
+  <li><a href="#base-r" id="toc-base-r">Base R</a></li>
+  <li><a href="#mirai-crew-and-future" id="toc-mirai-crew-and-future">mirai, crew, and future</a></li>
+  <li><a href="#callr" id="toc-callr">callr</a></li>
+  <li><a href="#python-workers" id="toc-python-workers">Python workers</a></li>
+  </ul></li>
+  </ul>
+</nav>
+<p>Two comparisons with mirai, timed with <a href="https://bench.r-lib.org">bench</a>, using four mizu workers and four mirai daemons. Setup time is excluded from the timings:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(mizu)</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(mirai)</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">daemons</span>(<span class="dv">4</span>L)</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>p <span class="ot">&lt;-</span> <span class="fu">mizu_pool</span>(<span class="at">n_workers =</span> <span class="dv">4</span>L)</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>diamonds <span class="ot">&lt;-</span> ggplot2<span class="sc">::</span>diamonds</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co"># The task function.</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>enrich <span class="ot">&lt;-</span> <span class="fu">evalq</span>(</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>  <span class="cf">function</span>(dat) {</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    dat<span class="sc">$</span>price_per_carat <span class="ot">&lt;-</span> dat<span class="sc">$</span>price <span class="sc">/</span> dat<span class="sc">$</span>carat</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    dat</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>  },</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>  <span class="fu">baseenv</span>()</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="co"># Speedup multiple of one bench row over another, from the medians</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>speedup <span class="ot">&lt;-</span> <span class="cf">function</span>(b, over, base) {</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>  <span class="fu">signif</span>(<span class="fu">as.numeric</span>(b<span class="sc">$</span>median[over]) <span class="sc">/</span> <span class="fu">as.numeric</span>(b<span class="sc">$</span>median[base]), <span class="at">digits =</span> <span class="dv">2</span>L)</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div>
+<h2 id="a-data-frame-round-trip">A data frame round trip</h2>
+<p>The <code>enrich()</code> task takes the 3.3 MB <code>diamonds</code> data frame, adds a column, and returns it. mirai serializes the data in each direction and copies it through a socket. mizu stages the frame once in shared memory. The worker reads it in place, and the enriched frame comes back the same way:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>roundtrip <span class="ot">&lt;-</span> bench<span class="sc">::</span><span class="fu">mark</span>(</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">mizu =</span> <span class="fu">mizu_collect</span>(<span class="fu">mizu_submit</span>(p, <span class="fu">enrich</span>(dat), <span class="at">dat =</span> diamonds, <span class="at">enrich =</span> enrich)),</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">mirai =</span> <span class="fu">collect_mirai</span>(<span class="fu">mirai</span>(<span class="fu">enrich</span>(dat), <span class="at">dat =</span> diamonds, <span class="at">enrich =</span> enrich))</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>roundtrip</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; # A tibble: 2 × 6</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt;   expression      min   median `itr/sec` mem_alloc `gc/sec`</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt;   &lt;bch:expr&gt; &lt;bch:tm&gt; &lt;bch:tm&gt;     &lt;dbl&gt; &lt;bch:byt&gt;    &lt;dbl&gt;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; 1 mizu       498.48µs  567.6µs     1162.  483.41KB      0  </span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; 2 mirai        6.55ms    7.4ms      133.    3.82MB     17.0</span></span></code></pre></div>
+<p>End to end, mizu is <strong>13x</strong> faster (median). Each timed run stages the frame, computes the new column over all 53,940 rows, and returns the enriched frame.</p>
+<h2 id="five-thousand-small-tasks">Five thousand small tasks</h2>
+<p>Each task computes the mean and standard deviation of a sliding window of 1,000 prices, about 10 µs of work.</p>
+<ul>
+<li>mirai sends one task per element through its dispatcher, and the per-task cost alone exceeds the work.</li>
+<li>mizu stages the map once, and the workers claim element ranges from a shared cursor.</li>
+</ul>
+<p>The serial <code>lapply()</code> row is the baseline a parallel map has to beat:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>winsum <span class="ot">&lt;-</span> <span class="fu">evalq</span>(<span class="cf">function</span>(i) {</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  w <span class="ot">&lt;-</span> ggplot2<span class="sc">::</span>diamonds<span class="sc">$</span>price[i<span class="sc">:</span>(i <span class="sc">+</span> <span class="dv">999</span>L)]</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">c</span>(<span class="at">mean =</span> <span class="fu">mean</span>(w), <span class="at">sd =</span> stats<span class="sc">::</span><span class="fu">sd</span>(w))</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>}, <span class="fu">baseenv</span>())</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>tasks <span class="ot">&lt;-</span> bench<span class="sc">::</span><span class="fu">mark</span>(</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">serial =</span> <span class="fu">lapply</span>(<span class="dv">1</span><span class="sc">:</span><span class="dv">5000</span>, winsum),</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">mizu =</span> <span class="fu">mizu_collect</span>(<span class="fu">mizu_map</span>(p, <span class="dv">1</span><span class="sc">:</span><span class="dv">5000</span>, winsum)),</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">mirai =</span> <span class="fu">collect_mirai</span>(<span class="fu">mirai_map</span>(<span class="dv">1</span><span class="sc">:</span><span class="dv">5000</span>, winsum))</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; Warning: Some expressions had a GC in every iteration; so filtering is</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; disabled.</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>tasks</span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; # A tibble: 3 × 6</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt;   expression      min   median `itr/sec` mem_alloc `gc/sec`</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt;   &lt;bch:expr&gt; &lt;bch:tm&gt; &lt;bch:tm&gt;     &lt;dbl&gt; &lt;bch:byt&gt;    &lt;dbl&gt;</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; 1 serial       43.7ms   59.8ms     16.6     77.1MB    40.6 </span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; 2 mizu         12.5ms   14.4ms     57.2    544.4KB     0   </span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; 3 mirai       532.6ms  532.6ms      1.88    47.4MB     3.76</span></span></code></pre></div>
+<p>With four workers, mizu is <strong>4.2x</strong> faster than the serial loop and <strong>37x</strong> faster than mirai (median).</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">daemons</span>(<span class="dv">0</span>L)</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_pool_stop</span>(p)</span></code></pre></div>
+<p>mirai is the general solution. It scales across machines, where serialization through sockets is unavoidable. On one machine, mizu removes that cost: data movement is an order of magnitude cheaper, and the per-task overhead is low enough that even microsecond-scale tasks benefit from parallelism.</p>
+<h2 id="how-mizu-compares">How mizu compares</h2>
+<p>mizu is built for parallelism across processes on one machine, with data moving through shared memory instead of serialized copies. The tools below differ in what has to run, how data moves, and where workers can run:</p>
+<table class="caption-top">
+<colgroup>
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tool</th>
+<th>What runs</th>
+<th>How data moves</th>
+<th>Best for</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>parallel</code></td>
+<td>Nothing beyond base R</td>
+<td>Fork copy-on-write (Unix); socket copies from a cluster</td>
+<td>Coarse tasks, maximum portability</td>
+</tr>
+<tr class="even">
+<td>mirai</td>
+<td>Daemon processes</td>
+<td>Serialized copies over nanonext sockets</td>
+<td>Local or remote workers, HPC clusters</td>
+</tr>
+<tr class="odd">
+<td>crew</td>
+<td>A mirai-based, auto-scaled controller</td>
+<td>Same as mirai</td>
+<td>Bursty workloads and pipelines</td>
+</tr>
+<tr class="even">
+<td>future</td>
+<td>A backend (multisession, multicore, mirai, …)</td>
+<td>Serialized copies; transport per backend</td>
+<td>Backend-agnostic parallel loops</td>
+</tr>
+<tr class="odd">
+<td>callr</td>
+<td>A fresh R process per call</td>
+<td>Serialized copies per call</td>
+<td>Isolated one-off computations</td>
+</tr>
+<tr class="even">
+<td>mizu</td>
+<td>Worker processes, no dispatcher</td>
+<td>Shared-memory views, µs handoff</td>
+<td>Fine-grained tasks, large vectors and frames, Python interop</td>
+</tr>
+</tbody>
+</table>
+<h3 id="base-r">Base R</h3>
+<p><code>mclapply()</code> forks workers on Unix. A fork is cheap because it shares the parent’s pages copy-on-write, but it is unavailable on Windows and composes poorly with threads, GUI sessions, and some external libraries. <code>parLapply()</code> over a socket cluster is the portable form, and it serializes every task and result through a socket.</p>
+<h3 id="mirai-crew-and-future">mirai, crew, and future</h3>
+<p>mirai dispatches tasks to daemon processes over nanonext sockets. Its dispatcher runs through callbacks rather than as a separate broker process. The socket copies are the trade-off: daemons can run anywhere a network reaches, including other machines and HPC clusters that shared memory cannot span. crew builds auto-scaling worker management on mirai for bursty pipelines.</p>
+<p>future layers a backend-agnostic interface over these and other backends (multisession, multicore, or mirai itself via future.mirai), so code ports between them unchanged. That abstraction costs much higher per-task overhead than either mirai or crew, on top of the backend’s own transport cost.</p>
+<h3 id="callr">callr</h3>
+<p>callr does something different. It evaluates R code in a fresh, isolated session with no state carried over, paying for the isolation with a process spawn and a serialized round trip per call. Use it for one-off isolation, not for splitting a loop.</p>
+<h3 id="python-workers">Python workers</h3>
+<p>Only mizu runs a pool whose workers are Python processes, exchanging vectors and data frames as shared-memory views (see <a href="interop.html">Python interop</a>).</p>
+<p>Use mizu when the work fits on one machine, when tasks are fine-grained or the data is large, or when you need Python workers. Use mirai or crew when workers must run on other machines or under a scheduler, and callr when a task needs a fresh session.</p>
+
+
+
+
+
+</body></html>

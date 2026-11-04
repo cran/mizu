@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.19">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Channels</title>
+<style>
+
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+width: 0.8em;
+margin: 0 0.8em 0.2em -1em;  vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+}
+pre.numberSource { margin-left: 3em; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+</style>
+</head>
+
+<body>
+
+
+<header id="title-block-header">
+<h1 class="title">Channels</h1>
+
+</header>
+
+<nav id="TOC" role="doc-toc">
+    <h2 id="toc-title">Table of contents</h2>
+   
+  <ul>
+  <li><a href="#promises-and-handlers" id="toc-promises-and-handlers">Promises and handlers</a></li>
+  </ul>
+</nav>
+<p>The main function is <code>mizu_channel()</code>. It creates a two-way shared-memory channel, with one lock-free ring per direction, and spawns a child R process connected to the other end. The child evaluates a quoted expression with <code>ch</code> bound to its side of the channel. Only a short join token is passed to the child on its command line; all data crosses through the rings.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(mizu)</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>ch <span class="ot">&lt;-</span> <span class="fu">mizu_channel</span>(<span class="fu">quote</span>(</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="cf">repeat</span> {</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    x <span class="ot">&lt;-</span> <span class="fu">mizu_recv</span>(ch, <span class="at">timeout =</span> <span class="dv">30</span>)</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">inherits</span>(x, <span class="st">&quot;mizu_sentinel&quot;</span>)) <span class="cf">break</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">mizu_send</span>(ch, x <span class="sc">*</span> <span class="dv">2</span>)</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>))</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_send</span>(ch, <span class="dv">21</span>)</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_recv</span>(ch, <span class="at">timeout =</span> <span class="dv">5</span>)</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 42</span></span></code></pre></div>
+<p><code>mizu_send()</code> publishes a message to the peer, and it is visible as soon as the call returns. <code>mizu_recv()</code> returns the next message. <code>mizu_send_batch()</code> and <code>mizu_recv_batch()</code> move a whole list of messages in one call. Use them at rates where the per-call overhead of R itself starts to matter.</p>
+<p>A full ring, a timeout, an orderly close, and peer death are returned as class-tagged sentinel values, not errors. A receive loop tests for them with <code>inherits(x, &quot;mizu_sentinel&quot;)</code>, or with the specific classes <code>mizu_full</code>, <code>mizu_timeout</code>, <code>mizu_closed</code>, <code>mizu_peer_gone</code>. <code>mizu_is_sentinel()</code> is the stricter test. It returns <code>TRUE</code> only for the sentinel objects that mizu itself returned, since a class test cannot tell a terminal state from a look-alike payload (a sentinel forwarded as a message arrives as an ordinary copy). No call needs an error handler. If the process at the other end dies, receives first drain the messages that it already published, then report <code>mizu_peer_gone</code>. <code>mizu_alive(ch)</code> reports at any time whether the peer still runs, without touching the rings. <code>mizu_channel_info(ch)</code> returns a read-only snapshot of the channel’s state: ring geometry and watermarks, the free-list and open caches, and the notify signals sent.</p>
+<p><code>mizu_close()</code> performs an orderly shutdown. It waits for the peer to finish reading its messages before it releases the shared resources:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_close</span>(ch)</span></code></pre></div>
+<p>If the peer’s code raises an error, the error crosses as data: a receive returns a <code>mizu_error_remote</code> condition object rather than signalling it. <code>mizu_is_remote_error()</code> tests for one, <code>conditionMessage()</code> leads with the remote type, and <code>stop(x)</code> signals it in your own session:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>ch <span class="ot">&lt;-</span> <span class="fu">mizu_channel</span>(<span class="fu">quote</span>(<span class="fu">stop</span>(<span class="st">&quot;boom&quot;</span>)))</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>x <span class="ot">&lt;-</span> <span class="fu">mizu_recv</span>(ch, <span class="at">timeout =</span> <span class="dv">5</span>)</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_is_remote_error</span>(x)</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] TRUE</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="fu">conditionMessage</span>(x)</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] &quot;simpleError: boom&quot;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_close</span>(ch)</span></code></pre></div>
+<p>The peer also prints the error to its standard error, which appears on your console by default. The <code>launcher</code> argument controls how the peer is spawned. The default <code>mizu_launcher()</code> takes <code>stdout</code> and <code>stderr</code> arguments, so <code>launcher = mizu_launcher(stderr = &quot;peer.log&quot;)</code> writes the error to a file instead. The same launcher spawns the R workers of <code>mizu_pool()</code>.</p>
+<h2 id="promises-and-handlers">Promises and handlers</h2>
+<p>In an event-driven program (a Shiny app, an <code>httpuv</code> server, anything built around an event loop), the channel can wait on a notify endpoint instead of blocking. When the peer publishes, the endpoint wakes the event loop, and <code>later</code> delivers the message on the main thread. There is no polling and no extra thread. This needs the <code>later</code> package, and <code>promises</code> for the promise forms.</p>
+<p><code>mizu_recv_async()</code> returns a promise without blocking. It resolves with the next message, the same object a blocking <code>mizu_recv()</code> would return, and rejects on close, peer death, or its own <code>timeout</code> with a classed error that carries the sentinel’s class name. <code>mizu_recv_handler()</code> is the stream form. It installs a function that the event loop calls with each burst of messages, and <code>batch = TRUE</code> delivers each burst as one list. Delivery is per burst, not per message. A promise costs tens of microseconds of R work against about a microsecond of transport, so use the batch handler for high message volumes. Every main-thread drain is bounded per event-loop turn and re-scheduled, so a saturated ring cannot starve the loop.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(promises)</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>ch <span class="ot">&lt;-</span> <span class="fu">mizu_channel</span>(<span class="fu">quote</span>(<span class="fu">mizu_send</span>(ch, <span class="fu">mizu_recv</span>(ch))))</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_recv_async</span>(ch) <span class="sc">%...&gt;%</span> <span class="fu">print</span>()</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_send</span>(ch, <span class="dv">42</span>L)</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> (<span class="sc">!</span>later<span class="sc">::</span><span class="fu">loop_empty</span>()) later<span class="sc">::</span><span class="fu">run_now</span>(<span class="dv">1</span>) <span class="co"># pump the loop until the resolution lands</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 42</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_close</span>(ch)</span></code></pre></div>
+<p>A channel can have only one of the two consumer forms at a time. Installing a handler while promises are pending, or requesting a promise while a handler is installed, is an error.</p>
+
+
+
+
+
+</body></html>

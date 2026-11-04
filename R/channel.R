@@ -1,261 +1,353 @@
-# Sentinels are interned singletons: classed environments, registered with
-# the C core at load (.onLoad), so identity is a pointer test and a class
-# look-alike payload can never forge one.
-new_sentinel <- function(class) {
-  structure(
-    new.env(parent = emptyenv()),
-    class = c(class, "mizu_sentinel")
-  )
-}
-
-#' Sentinel Values
+#' Create a Channel and Spawn Its Peer
 #'
-#' Singletons returned by [mizu_send()] and [mizu_recv()] that
-#' tag the terminal states of a channel as ordinary values, not signalled
-#' conditions, so hot loops stay branch-cheap. Dispatch with `inherits(x,
-#' "mizu_sentinel")` or on the specific class; use
-#' [mizu_is_sentinel()] where payloads are untrusted.
+#' Creates a shared-memory single-producer single-consumer channel, with one
+#' lock-free ring per direction, and spawns a child R process connected to the
+#' other end. The returned handle sends on the host-to-peer ring and receives on
+#' the peer-to-host ring. Only a short join token (the suffix of the region
+#' name) is passed to the child, as a command-line argument.
 #'
-#' * `mizu_full` — the buffer is at capacity ([mizu_send()]).
-#' * `mizu_timeout` — no value arrived within `timeout`
-#'   ([mizu_recv()]).
-#' * `mizu_closed` — the channel is closed and drained
-#'   ([mizu_inproc_close()]).
-mizu_full <- new_sentinel("mizu_full")
-
-#' @rdname mizu_full
-mizu_timeout <- new_sentinel("mizu_timeout")
-
-#' @rdname mizu_full
-mizu_closed <- new_sentinel("mizu_closed")
-
-#' Create a Channel
+#' `expr` is a quoted expression, not a closure. It captures nothing, and unlike
+#' [mizu_submit()], mizu does not quote it for you. The peer evaluates it in a
+#' fresh environment whose parent is the child's global environment, with `ch`
+#' (the peer-side channel handle) as the only binding that mizu provides. The
+#' expression must load any packages it needs. When the expression returns or
+#' errors, the peer signals an orderly close and exits. An error message goes to
+#' the child's standard error.
 #'
-#' Creates a single-producer single-consumer channel: a bounded ring buffer
-#' that holds up to `capacity` values until they are received. The ring
-#' buffer is implemented in C, with O(1) sends and receives. The transport
-#' is in-process — both ends of the channel live in the calling R process.
+#' Payloads interoperate with mori. A `mori::share()`d object anywhere inside a
+#' payload is serialized as its short identifier through the mori hooks, and is
+#' mapped zero-copy on the other side.
 #'
-#' This interface is experimental and may change in a future release.
+#' The channel's two liveness lock files, which detect the death of either side,
+#' are created in a per-platform directory: `/dev/shm` on Linux, and the
+#' per-user temporary directory on macOS and Windows. The path is recorded in
+#' the region, so both sides use the same files. The environment variable
+#' `MIZU_LIVENESS_DIR`, read in the creating process, overrides the default.
 #'
-#' @param capacity a positive integer: the number of values the channel
-#'   buffers before [mizu_send()] returns the [mizu_full]
-#'   sentinel.
+#' @param expr a quoted expression (for example `quote({ ... })`), evaluated
+#'   in the peer process with `ch` bound to the peer-side channel handle.
+#'   A single character string is instead UTF-8 source text in the peer's
+#'   language, for a non-R peer spawned by a custom `launcher` (an R peer
+#'   parses and evaluates it as R source).
+#' @param ... These dots are for future extensions and must be empty.
+#' @param capacity slots per ring. A power of two between 2 and 2^24.
+#' @param slot_size bytes per slot. A power of two between 64 and 2^20. The
+#'   inline payload budget is `slot_size - 16`. Payloads that serialize
+#'   larger spill to the arena, and past it to a fresh region.
+#' @param arena_size spill-arena bytes per direction. A multiple of 128, or 0 to
+#'   disable (every spill then creates a region). This bounds the in-flight
+#'   spill. An undersized arena falls back to creating a region per payload, and
+#'   never errors.
+#' @param spin `TRUE` makes the channel spin-wait: consumers never park and
+#'   producers skip the wake check on publish. Use this only when the consumer
+#'   never yields, because a spin-mode consumer that parks is never woken.
+#' @param startup_timeout seconds to wait for the peer to attach and signal
+#'   ready. On expiry, mizu releases the channel and raises
+#'   `mizu_error_startup` (see [mizu_error]).
+#' @param launcher a `function(token)` that spawns the peer process. For an R
+#'   peer, it arranges for a process to call `mizu:::peer_main(token)`. The
+#'   default [mizu_launcher()] spawns `Rscript` and propagates the `.libPaths()`
+#'   of the host. Its `stdout` and `stderr` arguments direct the peer output,
+#'   including the error message. A custom launcher must arrange the library
+#'   paths itself. For a peer in another language (a source-string `expr`), it
+#'   spawns a program that attaches with `token` and speaks the wire protocol,
+#'   such as `python3 -m pymizu.child` for a Python peer. [mizu_py_launcher()]
+#'   is the ready-made launcher for that case.
 #'
-#' @return A channel (class `"mizu_inproc_channel"`).
+#' @return A channel handle (class `"mizu_channel"`). Handles are
+#'   process-private and do not survive `fork()`.
 #'
 #' @examples
-#' ch <- mizu_inproc_channel(2)
-#' mizu_send(ch, "a")
-#' mizu_send(ch, 42)
-#' mizu_recv(ch)
-#' mizu_recv(ch)
-#' mizu_inproc_close(ch)
+#' ch <- mizu_channel(quote(
+#'   repeat {
+#'     x <- mizu_recv(ch, timeout = 30)
+#'     if (inherits(x, "mizu_sentinel")) break
+#'     mizu_send(ch, x)
+#'   }
+#' ))
+#' mizu_send(ch, 42L)
+#' mizu_recv(ch, timeout = 5)
+#' mizu_close(ch)
 #'
-#' @useDynLib mizu, .registration = TRUE
 #' @export
-mizu_inproc_channel <- function(capacity) {
-  check_capacity(capacity)
-  structure(
-    .Call(mizu_inproc_ring_create, capacity),
-    class = "mizu_inproc_channel"
-  )
+mizu_channel <- function(
+  expr,
+  ...,
+  capacity = 16384L,
+  slot_size = 256L,
+  arena_size = 4194304,
+  spin = FALSE,
+  startup_timeout = 30,
+  launcher = mizu_launcher()
+) {
+  check_dots_empty(...)
+  if (!is.language(expr) && !is_scalar_string(expr)) {
+    stop(
+      "mizu: expr must be a quoted expression (wrap it in quote()) or a ",
+      "single source string (for a peer in another language)",
+      call. = FALSE
+    )
+  }
+  ch <- .Call(mizu_channel_create, expr, capacity, slot_size, arena_size, spin)
+  # a channel that never came up is destroyed, not left to its finalizer —
+  # on any error exit (launcher failure, interrupt), not just a timeout
+  ok <- FALSE
+  on.exit(if (!ok) .Call(mizu_channel_destroy, ch))
+  token <- .Call(mizu_channel_suffix, ch)
+  launcher(token)
+  if (!.Call(mizu_channel_ready_wait, ch, startup_timeout)) {
+    stop_startup("child", startup_timeout)
+  }
+  ok <- TRUE
+  ch
 }
 
 #' Send and Receive over a Channel
 #'
-#' `mizu_send()` appends `x` to the buffer of the channel. Sends never
-#' block: a send on a full channel returns the `mizu_full` sentinel
-#' immediately. `mizu_recv()` removes and returns the oldest buffered
-#' value, waiting up to `timeout` seconds for one to arrive.
+#' `mizu_send()` publishes a message to the peer. The message is visible as soon
+#' as the call returns, with no separate flush step. `mizu_recv()` returns the
+#' next message, and waits up to `timeout` seconds for it.
 #'
-#' Terminal states surface as class-tagged sentinels, not errors. Dispatch
-#' with `inherits(x, "mizu_sentinel")`, or on the specific classes:
+#' Sends never block for ring space. Receives report every terminal state
+#' as a class-tagged sentinel, not an error. Test for them with
+#' `inherits(x, "mizu_sentinel")`, or with the specific classes:
 #'
-#' * `mizu_full` — the buffer is at capacity (send). Receive first, or
-#'   drop the value.
-#' * `mizu_timeout` — no value arrived within `timeout` (recv).
-#' * `mizu_closed` — the channel was closed with
-#'   [mizu_inproc_close()]. A receive drains all buffered values before it
-#'   reports this.
+#' * `mizu_full` — the ring is full (send). Back off until the peer drains,
+#'   or drop the message.
+#' * `mizu_timeout` — no message arrived within `timeout` (recv).
+#' * `mizu_closed` — the other side closed the channel. A receive drains all
+#'   published messages before it reports this.
+#' * `mizu_peer_gone` — the peer died without closing. Death is detected through
+#'   the liveness lock that the kernel releases, as soon as the OS reports it. A
+#'   receive drains first here too, since the published messages of a dead peer
+#'   are complete and valid. Sticky once returned.
 #'
-#' `NULL` is a legal payload. Sentinels are ordinary values, identifiable by
-#' class alone, and never signalled conditions. [mizu_is_sentinel()]
-#' checks identity where payloads are untrusted.
+#' `NULL` is a legal payload. Sentinels are ordinary values identified by their
+#' class, never signalled conditions. [mizu_is_sentinel()] checks identity where
+#' payloads are untrusted.
 #'
-#' @param ch a channel from [mizu_inproc_channel()].
+#' `NULL` crosses as an immediate, with no serialization and no allocation on
+#' receive. A length-1 character vector that fits the inline budget crosses with
+#' a single byte copy, encoding mark preserved. Attribute-free non-ALTREP atomic
+#' vectors, and `integer64` vectors whose only attribute is the class, take a
+#' serialization-free path with a byte-identical round trip: inline within the
+#' budget, and past it as bare bytes in the arena or a spill region. Other plain
+#' values (attributed vectors, strings, lists, calls) cross as a compact binary
+#' stream written and read without R's serializer. Anything else is
+#' R-serialized. Mori-shared objects reduce to their identifiers through the
+#' mori hooks.
+#'
+#' A NumPy or Arrow `int64` array from a Python peer arrives as an `integer64`
+#' vector in bit64's layout, constructed without bit64. With bit64 loaded the
+#' result is fully functional, and without it the bits round-trip but print as
+#' raw doubles. The missing-value sentinel is shared in both directions: a
+#' genuine `INT64_MIN` reads as `NA_integer64_` in R, and an `NA_integer64_`
+#' arrives as `INT64_MIN` in Python.
+#'
+#' From a non-R peer, only vectors and strings are legal payloads. Anything else
+#' (a pymizu codec stream or a pickle) is declined, and the receive raises a
+#' classed `mizu_error_python_payload` error (see [mizu_error]). The declined
+#' message is consumed, so the channel keeps flowing.
+#'
+#' Large payloads can arrive as zero-copy views over shared memory. A view is a
+#' small R object that pins memory the garbage collector cannot see. To return
+#' that memory promptly, the receive functions (and worker task boundaries) run
+#' a minor garbage collection once 8 MiB of released view memory has
+#' accumulated. Re-receiving the same region does not re-trigger it. This
+#' is an occasional
+#' pause of about 0.2 ms, the largest latency outlier in the system. Set
+#' `options(mizu.gc_boundary)` (in bytes; `0` disables it) before loading the
+#' package to tune the threshold.
+#'
+#' @param ch a channel handle from [mizu_channel()] (or the `ch` binding
+#'   inside a peer expression).
 #' @param x the payload: any R object.
-#' @param timeout seconds to wait before the call returns the
-#'   `mizu_timeout` sentinel. `Inf` (the default) waits indefinitely,
-#'   and `0` polls. The wait is a bounded spin-then-backoff poll on a
-#'   monotonic clock: system clock adjustments do not affect it, and Ctrl-C
-#'   stays responsive throughout.
+#' @param timeout seconds to wait for a message before returning the
+#'   `mizu_timeout` sentinel. `Inf` (the default) waits indefinitely;
+#'   `0` does not wait.
 #'
 #' @return `mizu_send()` returns `TRUE` (invisibly) on success, or a
-#'   sentinel otherwise. `mizu_recv()` returns the received value or a
+#'   sentinel otherwise. `mizu_recv()` returns the received payload or a
 #'   sentinel.
 #'
 #' @examples
-#' ch <- mizu_inproc_channel(1)
-#' mizu_send(ch, "a")
-#' mizu_send(ch, "b")  # full: returns the mizu_full sentinel
-#' mizu_recv(ch)
-#' mizu_recv(ch, timeout = 0)
-#' mizu_inproc_close(ch)
+#' ch <- mizu_channel(quote(mizu_send(ch, mizu_recv(ch))))
+#' mizu_send(ch, list(1, "a"))
+#' mizu_recv(ch, timeout = 5)
+#' mizu_close(ch)
 #'
 #' @export
-mizu_send <- function(ch, x) {
-  check_channel(ch)
-  invisible(.Call(mizu_inproc_ring_send, ch, x))
-}
+mizu_send <- function(ch, x) invisible(.Call(mizu_channel_send, ch, x))
 
 #' @rdname mizu_send
 #' @export
-mizu_recv <- function(ch, timeout = Inf) {
-  check_channel(ch)
-  check_timeout(timeout)
-  .Call(mizu_inproc_ring_recv, ch, timeout)
+mizu_recv <- function(ch, timeout = Inf) .Call(mizu_channel_recv, ch, timeout)
+
+#' Batched Send and Receive
+#'
+#' At high message rates the cost of each R call matters.
+#' `mizu_send_batch()` moves a list of payloads in a single `.Call` and
+#' publishes them to the peer in one batched tail store.
+#' `mizu_recv_batch()` drains up to `n` messages in a single park cycle and
+#' a single batched head publication.
+#'
+#' @inheritParams mizu_send
+#' @param xs a list of payloads.
+#' @param n maximum number of messages to return.
+#'
+#' @return `mizu_send_batch()` returns the number of messages accepted. This is
+#'   less than `length(xs)` when the ring filled or the channel closed midway.
+#'   Send the next element with [mizu_send()] to learn which.
+#'   `mizu_recv_batch()` waits for the first message like [mizu_recv()] and
+#'   returns its sentinels on timeout, close, or peer death. It then returns a
+#'   list of 1 to `n` already-published messages without waiting further. A
+#'   batch that reaches a message it cannot read (a foreign Python payload)
+#'   returns what it read before it, and the failure surfaces on the next
+#'   receive, which raises as [mizu_recv()] does. The batch itself raises when
+#'   the first message is the one declined.
+#'
+#' @examples
+#' ch <- mizu_channel(quote(mizu_send_batch(ch, mizu_recv_batch(ch, 3L))))
+#' mizu_send_batch(ch, list(1, 2, 3))
+#' mizu_recv_batch(ch, 3L, timeout = 5)
+#' mizu_close(ch)
+#'
+#' @export
+mizu_send_batch <- function(ch, xs) .Call(mizu_channel_send_batch, ch, xs)
+
+#' @rdname mizu_send_batch
+#' @export
+mizu_recv_batch <- function(ch, n = 256L, timeout = Inf) {
+  .Call(mizu_channel_recv_batch, ch, n, timeout)
 }
 
 #' Close a Channel
 #'
-#' Orderly shutdown. Values buffered before the close remain receivable;
-#' further sends return the `mizu_closed` sentinel, and a receive on a
-#' drained channel returns the same. Closing an already-closed channel is a
-#' no-op.
+#' Signals close to the peer, then waits up to `timeout` seconds for the peer to
+#' close (or die). The peer confirms only after it has finished reading its
+#' messages, which is what makes it safe to release the resources held by sent
+#' payloads. On that confirmation, all resources are released and the region
+#' name is deleted. The handle is dead afterwards, and closing it again does
+#' nothing. On timeout the handle stays usable, and the resources are released
+#' at garbage collection, which runs the same check again.
+#'
+#' After either side signals close, sends on both sides return the
+#' `mizu_closed` sentinel, and receives drain the remaining messages before
+#' they return the same.
 #'
 #' @inheritParams mizu_send
+#' @param timeout seconds to wait for the close of the peer.
 #'
-#' @return Invisibly, `TRUE`.
-#'
-#' @examples
-#' ch <- mizu_inproc_channel(1)
-#' mizu_send(ch, "a")
-#' mizu_inproc_close(ch)
-#' mizu_recv(ch)
-#' mizu_recv(ch)
-#'
-#' @export
-mizu_inproc_close <- function(ch) {
-  check_channel(ch)
-  invisible(.Call(mizu_inproc_ring_close, ch))
-}
-
-#' Test for a mizu Sentinel
-#'
-#' Identity comparison against the interned sentinel singletons —
-#' [mizu_full], [mizu_timeout], and [mizu_closed] — that
-#' the verbs of mizu return to tag terminal states. `inherits(x,
-#' "mizu_sentinel")` tests the class alone, which any payload can
-#' carry. This includes a genuine sentinel forwarded over a channel, which
-#' arrives as an ordinary copy. `mizu_is_sentinel()` is provenance: `TRUE`
-#' only for the exact objects that the own calls of mizu return. So code
-#' that relays untrusted values can distinguish its terminal states from
-#' look-alike payloads.
-#'
-#' Sentinels are ordinary values, not R conditions: nothing is signalled,
-#' and condition handlers never see them.
-#'
-#' @param x any R object.
-#'
-#' @return `TRUE` or `FALSE`.
+#' @return Invisibly, `TRUE` on a clean mutual close, `FALSE` on timeout
+#'   (with a warning).
 #'
 #' @examples
-#' ch <- mizu_inproc_channel(1)
-#' x <- mizu_recv(ch, timeout = 0)
-#' mizu_is_sentinel(x)
-#' mizu_is_sentinel(42)
-#' # class alone does not make a sentinel:
-#' mizu_is_sentinel(
-#'   structure("x", class = c("mizu_timeout", "mizu_sentinel"))
-#' )
-#' mizu_inproc_close(ch)
+#' ch <- mizu_channel(quote(mizu_send(ch, "done")))
+#' mizu_recv(ch, timeout = 5)
+#' mizu_close(ch)
 #'
 #' @export
-mizu_is_sentinel <- function(x) .Call(mizu_sentinel_check, x)
-
-#' Print Methods for mizu Objects
-#'
-#' One-line summaries. A channel prints its state — `open` or `closed` —
-#' and the number of buffered values out of its capacity. Sentinels print as
-#' their class. The methods never error, so auto-printing is always safe.
-#'
-#' @param x the object.
-#' @param ... ignored.
-#'
-#' @return `x`, invisibly.
-#'
-#' @examples
-#' ch <- mizu_inproc_channel(2)
-#' ch
-#' mizu_send(ch, "a")
-#' ch
-#' mizu_inproc_close(ch)
-#'
-#' @export
-print.mizu_inproc_channel <- function(x, ...) {
-  st <- tryCatch(.Call(mizu_inproc_ring_stat, x), error = function(e) NULL)
-  cat(
-    if (is.null(st)) {
-      "<mizu_inproc_channel: invalid>\n"
-    } else {
-      sprintf(
-        "<mizu_inproc_channel: %s, %d/%d buffered>\n",
-        if (st[3L] != 0L) "closed" else "open",
-        st[1L],
-        st[2L]
-      )
-    }
-  )
-  invisible(x)
-}
-
-#' @rdname print.mizu_inproc_channel
-#' @export
-print.mizu_sentinel <- function(x, ...) {
-  cat(sprintf("<%s>\n", class(x)[1L]))
-  invisible(x)
-}
-
-check_capacity <- function(capacity) {
-  if (
-    !is.numeric(capacity) ||
-      length(capacity) != 1L ||
-      is.na(capacity) ||
-      capacity < 1 ||
-      capacity > .Machine$integer.max ||
-      capacity != trunc(capacity)
-  ) {
-    stop("mizu: capacity must be a positive integer", call. = FALSE)
+mizu_close <- function(ch, timeout = 5) {
+  ok <- .Call(mizu_channel_close, ch, timeout)
+  if (ok) {
+    # the rendezvous tears the handle down C-side; pending promises and a
+    # handler get their terminal delivery here, once, in order
+    notify_chan_flush_closed(ch)
   }
-}
-
-check_channel <- function(ch) {
-  if (!inherits(ch, "mizu_inproc_channel")) {
-    stop(
-      "mizu: ch must be a channel created by mizu_inproc_channel()",
+  if (!ok) {
+    warning(
+      "mizu: close timed out waiting for the peer; resources release ",
+      "when the handle is garbage collected",
       call. = FALSE
     )
   }
+  invisible(ok)
 }
 
-check_timeout <- function(timeout) {
-  if (
-    !is.numeric(timeout) ||
-      length(timeout) != 1L ||
-      is.na(timeout) ||
-      timeout < 0
-  ) {
-    stop("mizu: timeout must be a non-negative number", call. = FALSE)
-  }
-}
+#' Check Whether the Channel Peer Is Alive
+#'
+#' Reports whether the peer process still holds its liveness lock, in
+#' about a microsecond, without touching the rings. [mizu_recv()] and
+#' [mizu_send()] report peer death automatically as `mizu_peer_gone`.
+#' This function asks directly. A peer that closed the channel but still
+#' runs counts as alive.
+#'
+#' @inheritParams mizu_send
+#'
+#' @return `TRUE` while the peer process is alive, `FALSE` after it dies.
+#'   By then the survivor has deleted the channel's shared memory.
+#'
+#' @examples
+#' ch <- mizu_channel(quote(mizu_recv(ch)))
+#' mizu_alive(ch)
+#' mizu_close(ch)
+#'
+#' @export
+mizu_alive <- function(ch) .Call(mizu_channel_alive, ch)
 
-# Register the interned sentinels with the C core.
-.onLoad <- function(libname, pkgname) {
-  .Call(
-    mizu_sentinels_init,
-    mizu_full,
-    mizu_timeout,
-    mizu_closed
+#' Inspect a Channel
+#'
+#' A read-only snapshot of the channel region and the handle-local
+#' counters: ring geometry and watermarks, the free-list and open
+#' caches, and the notify signals sent to an armed async consumer.
+#'
+#' @inheritParams mizu_send
+#'
+#' @return A list with elements `name` (the platform region name, kept
+#'   for debugging), `side`, `capacity`, `slot_size`, `arena_size`,
+#'   `inline_max`, `spin`, `ready`, `closed`, `peer_pid`, `tx_sent`,
+#'   `tx_published`, `tx_consumed`, `rx_consumed`, `rx_published`,
+#'   `fl_entries`, `fl_hits`, `open_hits`, `open_misses`,
+#'   `ledger_entries`, `zc_open_hits`, `zc_open_misses`, and
+#'   `notify_sends`.
+#'
+#' @examples
+#' ch <- mizu_channel(quote(mizu_recv(ch)))
+#' mizu_channel_info(ch)
+#' mizu_close(ch)
+#'
+#' @export
+mizu_channel_info <- function(ch) .Call(mizu_channel_stat, ch)
+
+# Peer entry point: invoked through the Rscript child runner by the launcher.
+# Rebuilds the region name from the compiled-in prefix plus the token (the
+# name's suffix), attaches writable, validates the preamble, takes its liveness
+# lock, points its death listener at the host, and materializes the staged
+# expression *before* signalling ready — the host's mizu_channel frame holds
+# the expression (and every region its identifiers name) alive exactly until
+# then. The epilogue is the peer half of the close protocol.
+peer_main <- function(token) {
+  child_prologue()
+  att <- .Call(mizu_channel_attach, token, NULL)
+  ch <- att[[1L]]
+  expr <- att[[2L]]
+  # quit() runs no exit actions: the normal path signals close explicitly
+  # below — this fires only on an abnormal unwinding (e.g. the err send in
+  # the error handler itself failing), so the host still reads CLOSED
+  on.exit(.Call(mizu_channel_close_signal, ch))
+  .Call(mizu_channel_ready_set, ch)
+  env <- new.env(parent = globalenv())
+  env[["ch"]] <- ch
+  status <- 0L
+  tryCatch(
+    # a character drop is UTF-8 source text (MIZU_DROP_SOURCE); parse errors
+    # are peer errors, an orderly close like an eval error
+    eval(if (is.character(expr)) parse(text = expr) else expr, envir = env),
+    error = function(e) {
+      cat(
+        "mizu peer error: ",
+        conditionMessage(e),
+        "\n",
+        sep = "",
+        file = stderr()
+      )
+      # the err stream crosses ahead of the close signal, whatever the
+      # peer's language; a full ring drops it (the stderr line stands)
+      .Call(mizu_channel_send_error, ch, e)
+      status <<- 1L
+    },
+    interrupt = function(e) status <<- 2L
   )
+  .Call(mizu_channel_close_signal, ch)
+  quit(save = "no", status = status)
 }

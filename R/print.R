@@ -1,0 +1,169 @@
+#' Print Methods for mizu Objects
+#'
+#' One-line summaries. A channel prints its region name, side, and conversation
+#' state: `open`, `closed` once either side signalled close, or `peer gone` as
+#' reported by [mizu_alive()], probed at print. A pool prints its region name,
+#' the role of this handle, live workers out of registry capacity, and pending
+#' (uncompleted) tasks. A task handle prints its state, probed without consuming
+#' the result. The state is `pending`, `running`, `ok`, `err`, `cancel`,
+#' `died`, or `lost` in the result-slot vocabulary of [mizu_pool_info()],
+#' `collected` once the result is taken, or `dropped` when its pool is gone. A
+#' [mizu_call()] task specification prints its qualified name, or the first
+#' line of its source string truncated, and its argument counts. Sentinels
+#' print as their class.
+#' The handle methods never error and never touch the rings, and a handle whose
+#' resources are released (a closed channel, a stopped pool) prints as closed,
+#' so auto-printing is always safe.
+#'
+#' @param x the object.
+#' @param ... ignored.
+#'
+#' @return `x`, invisibly.
+#'
+#' @examples
+#' p <- mizu_pool()
+#' p
+#' t <- mizu_submit(p, 1 + 1)
+#' t
+#' mizu_collect(t)
+#' mizu_pool_stop(p)
+#' p
+#'
+#' mizu_call("stats::quantile", runif(10))
+#'
+#' @export
+print.mizu_channel <- function(x, ...) {
+  st <- tryCatch(.Call(mizu_channel_stat, x), error = function(e) NULL)
+  cat(
+    if (is.null(st)) {
+      "<mizu_channel: closed>\n"
+    } else {
+      sprintf(
+        "<mizu_channel %s: %s, %s>\n",
+        st[["name"]],
+        st[["side"]],
+        if (st[["closed"]]) {
+          "closed"
+        } else if (mizu_alive(x)) {
+          "open"
+        } else {
+          "peer gone"
+        }
+      )
+    }
+  )
+  invisible(x)
+}
+
+#' @rdname print.mizu_channel
+#' @export
+print.mizu_pool <- function(x, ...) {
+  st <- tryCatch(mizu_pool_info(x), error = function(e) NULL)
+  cat(
+    if (is.null(st)) {
+      "<mizu_pool: closed>\n"
+    } else {
+      sprintf(
+        "<mizu_pool %s: %s, %d/%d workers live, %d pending%s>\n",
+        st[["name"]],
+        st[["role"]],
+        sum(st[["workers"]] == "live"),
+        st[["max_workers"]],
+        st[["tasks"]][["pending"]] + st[["tasks"]][["running"]],
+        if (st[["shutdown"]]) ", shutdown" else ""
+      )
+    }
+  )
+  invisible(x)
+}
+
+#' @rdname print.mizu_channel
+#' @export
+print.mizu_task <- function(x, ...) {
+  cat(sprintf("<mizu_task: %s>\n", .Call(mizu_pool_task_state, x)))
+  invisible(x)
+}
+
+#' @rdname print.mizu_channel
+#' @export
+print.mizu_call <- function(x, ...) {
+  head <- if (x[["kind"]] == 0L) {
+    x[["code"]]
+  } else {
+    src <- strsplit(x[["code"]], "\n", fixed = TRUE)[[1L]]
+    sprintf('source "%s"', if (length(src)) src[[1L]] else "")
+  }
+  if (nchar(head) > 60L) {
+    head <- paste0(strtrim(head, 57L), "...")
+  }
+  np <- length(x[["positional"]])
+  nn <- length(x[["named"]])
+  cat(sprintf(
+    "<mizu_call: %s%s>\n",
+    head,
+    if (np > 0L && nn > 0L) {
+      sprintf(", %d positional, %d named", np, nn)
+    } else if (np > 0L) {
+      sprintf(", %d positional", np)
+    } else if (nn > 0L) {
+      sprintf(", %d named", nn)
+    } else {
+      ""
+    }
+  ))
+  invisible(x)
+}
+
+#' @rdname print.mizu_channel
+#' @export
+print.mizu_map <- function(x, ...) {
+  st <- x[["st"]]
+  cat(sprintf(
+    "<mizu_map: %.0f elements, %s>\n",
+    st[["n"]],
+    if (isTRUE(x[["done"]])) {
+      "collected"
+    } else if (isTRUE(x[["promised"]])) {
+      "promise pending"
+    } else if (isTRUE(st[["stream"]])) {
+      "streaming, submitted"
+    } else {
+      sprintf(
+        "%s, submitted",
+        if (is.null(st[["blob"]])) st[["name"]] else "inline blob"
+      )
+    }
+  ))
+  invisible(x)
+}
+
+#' @rdname print.mizu_channel
+#' @export
+print.mizu_map_prepared <- function(x, ...) {
+  cat(sprintf(
+    "<mizu_map_prepared: %.0f elements, %s>\n",
+    length(x[["x"]]),
+    if (is.null(x[["st"]])) {
+      "stale (next run restages)"
+    } else if (is.null(x[["st"]][["blob"]])) {
+      x[["st"]][["name"]]
+    } else {
+      "inline blob"
+    }
+  ))
+  invisible(x)
+}
+
+#' @rdname print.mizu_channel
+#' @export
+print.mizu_sentinel <- function(x, ...) {
+  cat(sprintf("<%s>\n", class(x)[1L]))
+  invisible(x)
+}
+
+#' @rdname print.mizu_channel
+#' @export
+print.mizu_error_remote <- function(x, ...) {
+  cat(sprintf("<mizu_error_remote: %s>\n", conditionMessage(x)))
+  invisible(x)
+}

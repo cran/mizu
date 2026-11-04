@@ -1,0 +1,861 @@
+# Event-driven promises and handlers: the notify endpoints of the vendored
+# core, surfaced through later and promises. A channel side or a pool
+# submitter arms its endpoint; a producer signals it at the same fenced
+# checkpoint where it tests the parked announce, so a pending consumer is
+# woken without polling. The core's watch fires a pure-C callback on its
+# listener thread, which schedules the drain on the main thread through
+# later's execLaterNative2 (src/notify_r.c). Every drain is bounded per
+# callback (notify_quantum_n items or ~1 ms, whichever first) and
+# re-scheduled with later(secs = 0) while more remains — a saturated ring
+# cannot starve the event loop. Resolution is per-burst / per-collection,
+# never per-item beyond the small-count forms: the handler's batch form
+# delivers one list per drain pass, and the collective verbs resolve
+# exactly one promise per collection.
+
+# The drain quantum: at most this many messages delivered / waiters
+# settled, or this many seconds of resolution work, per later callback.
+# The seconds bound is the real guard for promise resolution (tens of
+# microseconds each); messages are cheap enough that the items bound
+# only bites ahead of it, and it sizes the batch handler's burst read.
+notify_quantum_n <- 2048L
+notify_quantum_secs <- 0.001
+
+# The async verbs' package guards: the requireNamespace probes memoize
+# (they ran twice per async verb call); the env's fields mutate where a
+# namespace binding could not.
+notify_pkgs <- new.env(parent = emptyenv())
+
+notify_require_pkg <- function(pkg, msg) {
+  if (!isTRUE(notify_pkgs[[pkg]])) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      stop(msg, call. = FALSE)
+    }
+    notify_pkgs[[pkg]] <- TRUE
+  }
+  invisible()
+}
+
+notify_requires <- function() {
+  notify_require_pkg(
+    "later",
+    "mizu: the async verbs require the 'later' package to be installed"
+  )
+  notify_require_pkg(
+    "promises",
+    "mizu: the async verbs require the 'promises' package to be installed"
+  )
+}
+
+notify_requires_later <- function() {
+  notify_require_pkg(
+    "later",
+    "mizu: mizu_recv_handler() requires the 'later' package to be installed"
+  )
+}
+
+# Cancel a waiter's later() timer, if one is armed. later() returns its
+# own cancel function; cancelling a spent registration is a no-op.
+cancel_timer <- function(w) {
+  timer <- w[["timer"]]
+  if (!is.null(timer)) {
+    w[["timer"]] <- NULL
+    timer()
+  }
+  invisible()
+}
+
+# Channel state ---------------------------------------------------------------
+
+# The per-channel notify state env (prot slot [3] of the handle): mode
+# NULL | "promise" | "handler" (the two consumer forms are exclusive),
+# the pending-promise FIFO, the handler and its batch flag, and the
+# .drain closure the C bridge calls. The FIFO is an env linked list
+# (fifo_head / fifo_tail, w[["next"]] links): O(1) push and pop — a list
+# paid a vector copy per op either end, quadratic per burst at depth.
+notify_chan_state <- function(ch) {
+  st <- .Call(mizu_chan_notify_peek, ch)
+  if (is.null(st)) {
+    st <- new.env(parent = emptyenv())
+    st[["ch"]] <- ch
+    st[["mode"]] <- NULL
+    st[["fifo_head"]] <- NULL
+    st[["fifo_tail"]] <- NULL
+    st[["batch"]] <- FALSE
+    st[[".drain"]] <- function() chan_drain(st)
+    .Call(mizu_chan_notify_set, ch, st)
+  }
+  st
+}
+
+chan_disarm <- function(state) {
+  state[["mode"]] <- NULL
+  state[["fifo_head"]] <- NULL
+  state[["fifo_tail"]] <- NULL
+  state[["fn"]] <- NULL
+  .Call(mizu_chan_notify_disarm, state[["ch"]])
+  invisible()
+}
+
+# Push one waiter (envs carry their resolve/reject; w[["next"]] links).
+chan_fifo_push <- function(state, w) {
+  w[["next"]] <- NULL
+  if (is.null(state[["fifo_head"]])) {
+    state[["fifo_head"]] <- w
+  } else {
+    state[["fifo_tail"]][["next"]] <- w
+  }
+  state[["fifo_tail"]] <- w
+  invisible()
+}
+
+# Pop the head waiter, or NULL when empty.
+chan_fifo_pop <- function(state) {
+  w <- state[["fifo_head"]]
+  if (is.null(w)) {
+    return(NULL)
+  }
+  state[["fifo_head"]] <- w[["next"]]
+  if (is.null(state[["fifo_head"]])) {
+    state[["fifo_tail"]] <- NULL
+  }
+  w[["next"]] <- NULL
+  w
+}
+
+# Remove a waiter from the FIFO by identity (its timer fired, or it
+# settled); disarm when the FIFO runs empty.
+chan_fifo_remove <- function(state, w) {
+  prev <- NULL
+  cur <- state[["fifo_head"]]
+  while (!is.null(cur)) {
+    if (identical(cur, w)) {
+      nxt <- cur[["next"]]
+      if (is.null(prev)) {
+        state[["fifo_head"]] <- nxt
+      } else {
+        prev[["next"]] <- nxt
+      }
+      if (identical(state[["fifo_tail"]], cur)) {
+        state[["fifo_tail"]] <- prev
+      }
+      cur[["next"]] <- NULL
+      break
+    }
+    prev <- cur
+    cur <- cur[["next"]]
+  }
+  if (is.null(state[["fifo_head"]]) && identical(state[["mode"]], "promise")) {
+    chan_disarm(state)
+  }
+  invisible()
+}
+
+# The terminal delivery shared by the drain and the mizu_close flush: the
+# handler gets the condition as its final call; every pending promise
+# rejects with it. Then the consumer disarms.
+chan_terminal <- function(state, cond) {
+  if (identical(state[["mode"]], "handler")) {
+    fn <- state[["fn"]]
+    chan_disarm(state)
+    fn(cond)
+  } else {
+    w <- state[["fifo_head"]]
+    chan_disarm(state)
+    while (!is.null(w)) {
+      cancel_timer(w)
+      w[["reject"]](cond)
+      w <- w[["next"]]
+    }
+  }
+  invisible()
+}
+
+# One handler call with the error discipline: an erroring handler is
+# removed (the consumer disarmed), then the error propagates out of the
+# drain — later surfaces it at the loop's run site.
+chan_call_fn <- function(state, arg) {
+  tryCatch(
+    state[["fn"]](arg),
+    error = function(e) {
+      chan_disarm(state)
+      stop(e)
+    }
+  )
+}
+
+# The main-thread channel drain: resolve waiters / deliver to the handler
+# out of the ring, bounded per callback. Ends disarmed (nothing pending),
+# armed-and-sleeping (the watch fires on the next burst), or re-scheduled
+# (the quantum is spent and work remains).
+chan_drain <- function(state) {
+  # a timer can disarm between the watch's signal and this callback, so
+  # the mode may be gone at entry — read it (and the batch flag) once,
+  # not per item; the loop head re-checks it in handler mode, whose fn
+  # is user code run mid-pass
+  mode <- state[["mode"]]
+  if (is.null(mode)) {
+    return(invisible())
+  }
+  batch <- isTRUE(state[["batch"]])
+  t0 <- mono_time()
+  items <- 0L
+  repeat {
+    # fn can remove or replace the consumer mid-pass: end the pass — the
+    # replacement's own arm covers the ring, and a removed consumer is
+    # never re-armed below
+    if (identical(mode, "handler") && !identical(state[["mode"]], mode)) {
+      return(invisible())
+    }
+    # the FIFO can empty mid-pass with messages still in the ring: disarm
+    # ahead of consuming anything with nobody waiting (the next arm's
+    # availability report picks those messages up)
+    if (identical(mode, "promise") && is.null(state[["fifo_head"]])) {
+      chan_disarm(state)
+      return(invisible())
+    }
+    x <- if (identical(mode, "handler") && batch) {
+      tryCatch(
+        .Call(mizu_channel_recv_batch, state[["ch"]], notify_quantum_n, 0),
+        mizu_error_python_payload = identity
+      )
+    } else {
+      tryCatch(
+        .Call(mizu_channel_recv, state[["ch"]], 0),
+        mizu_error_python_payload = identity
+      )
+    }
+    if (mizu_is_sentinel(x)) {
+      if (inherits(x, "mizu_timeout")) {
+        # ring empty: re-arm and re-check (the loop head owns the
+        # nothing-pending disarm; no waiter can leave the FIFO mid-pass)
+        avail <- .Call(mizu_chan_notify_arm, state[["ch"]], state)
+        if (!avail) {
+          return(invisible())
+        }
+      } else {
+        cond <- if (inherits(x, "mizu_closed")) {
+          cond_closed()
+        } else {
+          cond_peer_gone()
+        }
+        chan_terminal(state, cond)
+        return(invisible())
+      }
+    } else if (inherits(x, "mizu_error_python_payload")) {
+      # the foreign decline: consumed, the channel keeps flowing — reject
+      # the head waiter / deliver to the handler as the condition
+      items <- items + 1L
+      if (identical(mode, "handler")) {
+        chan_call_fn(state, x)
+      } else {
+        w <- chan_fifo_pop(state)
+        cancel_timer(w)
+        w[["reject"]](x)
+      }
+    } else {
+      items <- items +
+        if (identical(mode, "handler") && batch) {
+          chan_call_fn(state, x)
+          length(x)
+        } else if (identical(mode, "handler")) {
+          chan_call_fn(state, x)
+          1L
+        } else {
+          w <- chan_fifo_pop(state)
+          cancel_timer(w)
+          w[["resolve"]](x)
+          1L
+        }
+    }
+    # the clock read strides (per item it was a .Call per message): the
+    # quantum's seconds bound is advisory
+    if (
+      items >= notify_quantum_n ||
+        (items %% 64L == 0L && mono_time() - t0 >= notify_quantum_secs)
+    ) {
+      later::later(state[[".drain"]], 0)
+      return(invisible())
+    }
+  }
+}
+
+#' Receive Channel Messages as a Promise or a Stream
+#'
+#' `mizu_recv_async()` returns a [promises::promise()] immediately, without
+#' blocking. The promise resolves with the next received payload, the same R
+#' object a blocking [mizu_recv()] would have returned, zero-copy ALTREP views
+#' included. Chain it with [promises::then()] or the promise pipe `%...>%`.
+#'
+#' The promise rejects on `mizu_closed`, `mizu_peer_gone`, and `timeout` expiry
+#' with classed *error* conditions that carry the same class names as the
+#' sentinels, so `inherits(x, "mizu_closed")` works on either form. Close and
+#' peer death wake the event loop directly, so the rejection is prompt rather
+#' than waiting for the timeout.
+#'
+#' Several outstanding calls on one channel resolve in FIFO call order,
+#' one message each. No message is lost: messages already in the ring
+#' resolve immediately (still asynchronously, as promises require), and
+#' only messages yet to arrive wait on the event.
+#'
+#' `mizu_recv_handler()` is the stream form. It installs `fn` on the channel,
+#' and the event loop delivers each burst of messages to it without allocating a
+#' promise per message. With `batch = TRUE`, each drained burst is delivered as
+#' one list in a single `fn(list)` call, which is the high-throughput form. With
+#' `batch = FALSE`, `fn(value)` is called once per message. Close and peer death
+#' are delivered to `fn` as the classed error conditions (`mizu_closed`,
+#' `mizu_peer_gone`), after which the handler is removed. A declined foreign
+#' payload (see [mizu_send()]) is delivered as its `mizu_error_python_payload`
+#' condition and the handler continues. An error raised by `fn` removes the
+#' handler and propagates at the event loop. `mizu_recv_handler(ch, NULL)`
+#' removes the handler.
+#'
+#' A channel message belongs to whoever takes it first. A channel can have only
+#' one of the two consumer forms at a time: installing a handler while promises
+#' are pending, or requesting a promise while a handler is installed, is an
+#' error. A blocking [mizu_recv()] mixed with either consumer form consumes in
+#' arrival order, so the blocking call may take a message that a promise or the
+#' handler was waiting on. A close or peer death that it observes is observed by
+#' the consumer too, because both are channel state, re-read on every receive
+#' and never consumed. (A task result instead belongs to exactly one consumer;
+#' see [mizu_collect_all_async()].)
+#'
+#' Every main-thread drain is bounded per event-loop turn and
+#' re-scheduled, so a saturated ring starves neither Shiny nor
+#' [later::run_now()].
+#'
+#' Requires the \pkg{later} package, and \pkg{promises} for `mizu_recv_async()`.
+#'
+#' @param ch a channel handle from [mizu_channel()] (or the `ch` binding
+#'   inside a peer expression). Arming a `spin` channel errors: its
+#'   publish path skips the wake checkpoint by design.
+#' @param timeout seconds after which the promise rejects with the
+#'   `mizu_timeout` classed error. `Inf` (the default) waits
+#'   indefinitely.
+#' @param fn a `function(x)` called with each received message (or, with
+#'   `batch = TRUE`, each burst as one list), and finally with a
+#'   terminal condition. `NULL` removes the handler.
+#' @param batch deliver each drained burst to `fn` as one list in a
+#'   single call, instead of one call per message.
+#' @param x for the `as.promise` method: a channel handle, treated as
+#'   `mizu_recv_async(x)`.
+#'
+#' @return `mizu_recv_async()`: a [promises::promise()] resolving with
+#'   the next message. `mizu_recv_handler()`: the channel handle,
+#'   invisibly.
+#'
+#' @examplesIf interactive() && requireNamespace("promises", quietly = TRUE)
+#' library(promises)
+#' ch <- mizu_channel(quote(mizu_send(ch, mizu_recv(ch))))
+#' mizu_recv_async(ch) %...>% print()
+#' mizu_send(ch, 42L)
+#' later::run_now()
+#' mizu_close(ch)
+#'
+#' @export
+mizu_recv_async <- function(ch, timeout = Inf) {
+  notify_requires()
+  check_timeout(timeout)
+  state <- notify_chan_state(ch)
+  if (identical(state[["mode"]], "handler")) {
+    stop(
+      "mizu: a handler is installed on this channel \u2014 mizu_recv_async() ",
+      "and mizu_recv_handler() are mutually exclusive",
+      call. = FALSE
+    )
+  }
+  # the arm runs ahead of the promise action: promise() converts an error
+  # raised inside the action into a rejection, but arming failures (a spin
+  # channel, a dead peer) are call-site errors. A signal landing between
+  # here and the registration below schedules a drain that runs after the
+  # action (FIFO), so nothing is missed. The mode is set only once the
+  # arm stands: a failed arm leaves no consumer behind.
+  avail <- .Call(mizu_chan_notify_arm, ch, state)
+  state[["mode"]] <- "promise"
+  promises::promise(function(resolve, reject) {
+    w <- new.env(parent = emptyenv())
+    w[["resolve"]] <- resolve
+    w[["reject"]] <- reject
+    chan_fifo_push(state, w)
+    if (is.finite(timeout)) {
+      w[["timer"]] <- later::later(
+        function() {
+          chan_fifo_remove(state, w)
+          reject(cond_timeout())
+        },
+        timeout
+      )
+    }
+    if (avail) {
+      chan_drain(state)
+    }
+  })
+}
+
+#' @rdname mizu_recv_async
+#' @export
+mizu_recv_handler <- function(ch, fn, batch = FALSE) {
+  if (is.null(fn)) {
+    state <- .Call(mizu_chan_notify_peek, ch)
+    if (!is.null(state) && identical(state[["mode"]], "handler")) {
+      chan_disarm(state)
+    }
+    return(invisible(ch))
+  }
+  notify_requires_later()
+  if (!is.function(fn)) {
+    stop("mizu: fn must be a function or NULL", call. = FALSE)
+  }
+  state <- notify_chan_state(ch)
+  if (identical(state[["mode"]], "promise")) {
+    stop(
+      "mizu: promises are pending on this channel \u2014 mizu_recv_async() ",
+      "and mizu_recv_handler() are mutually exclusive",
+      call. = FALSE
+    )
+  }
+  # as in mizu_recv_async: a failed arm (a spin channel) leaves no
+  # consumer behind — the mode, fn and batch ride a successful arm only
+  avail <- .Call(mizu_chan_notify_arm, ch, state)
+  state[["mode"]] <- "handler"
+  state[["fn"]] <- fn
+  state[["batch"]] <- isTRUE(batch)
+  if (avail) {
+    chan_drain(state)
+  }
+  invisible(ch)
+}
+
+#' @rdname mizu_recv_async
+#' @exportS3Method promises::as.promise
+as.promise.mizu_channel <- function(x) mizu_recv_async(x)
+
+#' @rdname mizu_recv_async
+#' @exportS3Method promises::is.promising
+is.promising.mizu_channel <- function(x) TRUE
+
+# The mizu_close() flush (called after the close rendezvous): reject every
+# pending promise and deliver the terminal to a handler — the handle's
+# core-side teardown has already stopped the watch, so this is the last
+# delivery. Total on a released handle (the state env outlives it in the
+# prot chain).
+notify_chan_flush_closed <- function(ch) {
+  st <- .Call(mizu_chan_notify_peek, ch)
+  if (!is.null(st) && !is.null(st[["mode"]])) {
+    chan_terminal(st, cond_closed())
+  }
+  invisible()
+}
+
+# The mizu_pool_stop() flush: reject every enrolled waiter with the
+# stopped condition — the pool's analog of the close flush above. The
+# core stop releases the handle, so no enrolled waiter can ever settle;
+# the C half unlinks them (announces withdrawn) and disarms the registry.
+# A map waiter's watchdog timer rides cancel_timer with the rest.
+notify_pool_flush_stopped <- function(pool) {
+  ws <- .Call(mizu_pool_notify_flush, pool)
+  cond <- cond_stopped()
+  for (w in ws) {
+    cancel_timer(w)
+    if (identical(w[["kind"]], "map")) {
+      w[["map"]][["done"]] <- TRUE
+    }
+    w[["reject"]](cond)
+  }
+  invisible()
+}
+
+# Pool state ------------------------------------------------------------------
+
+# The per-pool-submitter notify state env (prot slot [6]): the pool
+# handle and the .drain closure the C bridge calls. The waiter registry
+# itself lives in C (src/notify_r.c, hung off the handle's notify
+# record): enrollment is one .Call that fuses the conflict check, the
+# per-slot NOTIFY announces, the endpoint arm, and the terminal probe —
+# probing terminal FIRST, so a task that already published settles from
+# the call site without ever arming — and the per-wake scan is one .Call
+# returning the settled waiters in registry order, unlinked with their
+# announces withdrawn. One coalescing notify word serves every
+# outstanding waiter of the submitter: each enrolled task carries the
+# announce on its own result slot, and a publish to any of them signals
+# the endpoint once per burst.
+notify_pool_state <- function(pool) {
+  st <- .Call(mizu_pool_notify_peek, pool)
+  if (is.null(st)) {
+    st <- new.env(parent = emptyenv())
+    st[["pool"]] <- pool
+    st[[".drain"]] <- function() pool_drain(st)
+    .Call(mizu_pool_notify_set, pool, st)
+  }
+  st
+}
+
+# Waiter modes: the C registry's settle verdicts.
+waiter_mode <- c(task = 0L, any = 1L, all = 2L, map = 3L)
+
+# Enroll one waiter (a stale task, a conflict, a submitter-less handle
+# are call-site errors — this runs ahead of the promise action). TRUE
+# when the waiter is terminal already and was not registered: the caller
+# settles it inside the action, where resolve/reject exist.
+pool_enroll <- function(state, w, tasks, wrap = NULL) {
+  .Call(
+    mizu_pool_notify_enroll,
+    state[["pool"]],
+    state,
+    w,
+    tasks,
+    waiter_mode[[w[["kind"]]]],
+    wrap
+  )
+}
+
+# Resolve or reject a settled waiter (unlinked by the scan, its announces
+# withdrawn). The collects run non-blocking — the scan proved terminal —
+# and a raised condition becomes the rejection: the same classed
+# condition the sync verb raises, index fields included. The task kind's
+# settle collect boxes every failure (no handler frame per task); the
+# collective forms keep the one tryCatch per collection.
+settle_waiter <- function(w) {
+  cancel_timer(w)
+  kind <- w[["kind"]]
+  if (kind == "task") {
+    v <- .Call(mizu_pool_collect_settle, w[["tasks"]][[1L]])
+    if (inherits(v, "mizu_caught")) {
+      w[["reject"]](v[[1L]])
+    } else {
+      w[["resolve"]](v)
+    }
+    return(invisible())
+  }
+  v <- if (kind == "any") {
+    tryCatch(.Call(mizu_pool_collect_any, w[["tasks"]], 0), error = identity)
+  } else if (kind == "all") {
+    tryCatch(.Call(mizu_pool_collect_all, w[["tasks"]], 0), error = identity)
+  } else {
+    # map: the ordinary gather — every runner terminal or abandoned, so
+    # map_collect never parks
+    m <- w[["map"]]
+    st <- m[["st"]]
+    m[["done"]] <- TRUE
+    v <- if (isTRUE(m[["cancelled"]])) {
+      map_cond_cancelled()
+    } else {
+      tryCatch(
+        map_collect(st, Inf, m[["collect"]], doomed0 = w[["doomed"]]),
+        error = identity
+      )
+    }
+    if (!inherits(v, "error")) {
+      pm <- m[["pm"]]
+      if (!is.null(pm) && !isTRUE(st[["consumed"]])) {
+        pm[["st"]] <- st
+      }
+    }
+    v
+  }
+  if (inherits(v, "error")) {
+    w[["reject"]](v)
+  } else {
+    w[["resolve"]](v)
+  }
+  invisible()
+}
+
+# The main-thread pool drain: scan, settle, scan again, until a scan comes
+# back empty — each scan re-arms the edge-triggered submitter word ahead
+# of its probe (the publish that woke the drain cleared it), so the empty
+# scan proves the re-armed word saw nothing: the announce/re-check
+# transplant. Bounded per callback: small scan batches keep the clock
+# check between them honest (a resolve is tens of microseconds), and a
+# spent quantum re-schedules with work left in the registry.
+pool_drain <- function(state) {
+  pool <- state[["pool"]]
+  t0 <- mono_time()
+  items <- 0L
+  repeat {
+    done <- .Call(mizu_pool_notify_scan, pool, 64L)
+    n <- length(done)
+    if (n == 0L) {
+      return(invisible())
+    }
+    for (i in seq_len(n)) {
+      settle_waiter(done[[i]])
+    }
+    items <- items + n
+    if (items >= notify_quantum_n || mono_time() - t0 >= notify_quantum_secs) {
+      later::later(state[[".drain"]], 0)
+      return(invisible())
+    }
+  }
+}
+
+#' Collect Pool Results as Promises
+#'
+#' `mizu_collect_all_async()` and `mizu_collect_any_async()` are the async
+#' counterparts of [mizu_collect_all()] and [mizu_collect_any()]. Each returns
+#' immediately with one [promises::promise()] for the whole collection, and no
+#' per-task promise is allocated. On each wake the pool checks for newly
+#' finished tasks, and when the collection completes, the result is assembled
+#' once as in the blocking version and the promise resolves.
+#'
+#' `mizu_collect_async()` is the single-task form, the async counterpart of
+#' [mizu_collect()]. It returns immediately with a [promises::promise()] that
+#' resolves with the task's value and rejects with the same classed condition a
+#' blocking collect would raise. There is one promise per task. While the task
+#' is pending the promise is cached, so a repeated call, or `as.promise()` on
+#' the handle (which [promises::then()] calls), returns the same promise, and
+#' `timeout` applies only to the call that created it. Once settled the task is
+#' collected, and a further call errors (one consumer per result, below). A
+#' `timeout` rejects with the `mizu_timeout` classed error and consumes nothing,
+#' so the task can be collected with a blocking call again.
+#'
+#' The behavior mirrors the blocking functions. Collect-all resolves in input
+#' order with names carried over, and the first erroring handle by position
+#' rejects with `index` (only that handle is consumed, the rest stay
+#' collectible). Collect-any resolves `list(index, value)` for the first
+#' terminal task, and a raised outcome rejects with the `index` field. A timeout
+#' rejects with the `mizu_timeout` classed error and consumes nothing. When a
+#' collection finishes, whether resolved, rejected, or timed out, every handle
+#' in it is released, and handles whose results were not consumed can be
+#' collected with a blocking call again.
+#'
+#' A task result belongs to exactly one consumer. A task with a promise
+#' attached, or one that is part of a pending collection, refuses
+#' [mizu_collect()], [mizu_collect_any()] and [mizu_collect_all()] with an error
+#' naming the pending consumer, and a task enrolled in a collection likewise
+#' refuses a promise. [mizu_cancel()] is still allowed and is the destructive
+#' option: the cancel publishes, the result is gone for every consumer, and the
+#' pending promise rejects with `mizu_error_cancelled`. A `timeout` is the
+#' non-destructive counterpart. It only detaches the promise, and the task keeps
+#' running with its result still collectible. (A channel message instead belongs
+#' to whoever takes it first; see [mizu_recv_async()].)
+#'
+#' Requires the \pkg{later} and \pkg{promises} packages.
+#'
+#' @param task a task handle from [mizu_submit()].
+#' @param tasks a non-empty list of task handles from [mizu_submit()] on
+#'   the same pool handle.
+#' @param timeout seconds after which the promise rejects with the
+#'   `mizu_timeout` classed error; nothing is consumed. `Inf` (the
+#'   default) waits indefinitely.
+#' @param x for the `as.promise` methods: a task handle, or a map handle
+#'   from [mizu_map()] / [mizu_map_run()].
+#'
+#' @return A [promises::promise()]: `mizu_collect_async()` resolves the
+#'   task's value; collect-all resolves a plain list of the task values
+#'   in the order of `tasks` (names carried); collect-any resolves
+#'   `list(index, value)`.
+#'
+#' @examplesIf interactive() && requireNamespace("promises", quietly = TRUE)
+#' library(promises)
+#' p <- mizu_pool(2L)
+#' t <- mizu_submit(p, sum(runif(10)))
+#' mizu_collect_async(t, timeout = 5) %...>% print()
+#' ts <- list(
+#'   total = mizu_submit(p, sum(x), x = runif(10)),
+#'   label = mizu_submit(p, "done")
+#' )
+#' mizu_collect_all_async(ts) %...>% print()
+#' later::run_now()
+#' mizu_pool_stop(p)
+#'
+#' @export
+mizu_collect_all_async <- function(tasks, timeout = Inf) {
+  notify_requires()
+  check_timeout(timeout)
+  if (!is.list(tasks) || !length(tasks)) {
+    stop("mizu: tasks must be a non-empty list of task handles", call. = FALSE)
+  }
+  pool <- .Call(mizu_task_pool, tasks[[1L]])
+  state <- notify_pool_state(pool)
+  w <- new.env(parent = emptyenv())
+  w[["kind"]] <- "all"
+  w[["tasks"]] <- tasks
+  ready <- pool_enroll(state, w, tasks)
+  promises::promise(function(resolve, reject) {
+    w[["resolve"]] <- resolve
+    w[["reject"]] <- reject
+    if (ready) {
+      settle_waiter(w)
+    } else if (is.finite(timeout)) {
+      # the removal withdraws the announces: the tasks return to
+      # blocking-collectible; FALSE means the drain settled it first
+      w[["timer"]] <- later::later(
+        function() {
+          if (.Call(mizu_pool_notify_remove, pool, w)) {
+            reject(cond_timeout())
+          }
+        },
+        timeout
+      )
+    }
+  })
+}
+
+#' @rdname mizu_collect_all_async
+#' @export
+mizu_collect_any_async <- function(tasks, timeout = Inf) {
+  notify_requires()
+  check_timeout(timeout)
+  if (!is.list(tasks) || !length(tasks)) {
+    stop("mizu: tasks must be a non-empty list of task handles", call. = FALSE)
+  }
+  pool <- .Call(mizu_task_pool, tasks[[1L]])
+  state <- notify_pool_state(pool)
+  w <- new.env(parent = emptyenv())
+  w[["kind"]] <- "any"
+  w[["tasks"]] <- tasks
+  ready <- pool_enroll(state, w, tasks)
+  promises::promise(function(resolve, reject) {
+    w[["resolve"]] <- resolve
+    w[["reject"]] <- reject
+    if (ready) {
+      settle_waiter(w)
+    } else if (is.finite(timeout)) {
+      # as on collect-all: the removal withdraws the announces, so the
+      # loser returns to blocking-collectible
+      w[["timer"]] <- later::later(
+        function() {
+          if (.Call(mizu_pool_notify_remove, pool, w)) {
+            reject(cond_timeout())
+          }
+        },
+        timeout
+      )
+    }
+  })
+}
+
+#' @rdname mizu_collect_all_async
+#' @export
+mizu_collect_async <- function(task, timeout = Inf) {
+  notify_requires()
+  check_timeout(timeout)
+  # the cached promise of an already-promised task (either spelling); a
+  # task enrolled in a collection refuses at the enroll, naming it
+  existing <- .Call(mizu_pool_notify_find, task)
+  if (!is.null(existing) && existing[["kind"]] == "task") {
+    return(existing[["promise"]])
+  }
+  tstate <- .Call(mizu_pool_task_state, task)
+  if (tstate == "collected" || tstate == "dropped") {
+    stop("mizu: task handle is already collected", call. = FALSE)
+  }
+  pool <- .Call(mizu_task_pool, task)
+  state <- notify_pool_state(pool)
+  w <- new.env(parent = emptyenv())
+  w[["kind"]] <- "task"
+  w[["tasks"]] <- list(task)
+  ready <- pool_enroll(state, w, w[["tasks"]])
+  promise <- promises::promise(function(resolve, reject) {
+    w[["resolve"]] <- resolve
+    w[["reject"]] <- reject
+    if (ready) {
+      settle_waiter(w)
+    } else if (is.finite(timeout)) {
+      # as on the collections: the removal withdraws the announce, so
+      # the task returns to blocking-collectible; FALSE means the drain
+      # settled it first
+      w[["timer"]] <- later::later(
+        function() {
+          if (.Call(mizu_pool_notify_remove, pool, w)) {
+            reject(cond_timeout())
+          }
+        },
+        timeout
+      )
+    }
+  })
+  w[["promise"]] <- promise
+  promise
+}
+
+#' @rdname mizu_collect_all_async
+#' @exportS3Method promises::as.promise
+as.promise.mizu_task <- function(x) mizu_collect_async(x)
+
+#' @rdname mizu_collect_all_async
+#' @exportS3Method promises::is.promising
+is.promising.mizu_task <- function(x) TRUE
+
+#' @rdname mizu_collect_all_async
+#' @exportS3Method promises::as.promise
+as.promise.mizu_map <- function(x) {
+  notify_requires()
+  if (!is.null(x[["promise"]])) {
+    return(x[["promise"]])
+  }
+  if (isTRUE(x[["done"]])) {
+    stop("mizu: map handle is already collected", call. = FALSE)
+  }
+  st <- x[["st"]]
+  if (isTRUE(st[["stream"]])) {
+    stop(
+      "mizu: a streaming map handle cannot be promise-armed \u2014 collect it ",
+      "with mizu_collect()",
+      call. = FALSE
+    )
+  }
+  if (isTRUE(st[["empty"]])) {
+    # no enrollment: nothing runs, nothing publishes — resolve at once
+    x[["done"]] <- TRUE
+    x[["promised"]] <- TRUE
+    promise <- promises::promise(function(resolve, reject) {
+      resolve(map_empty_result(st))
+    })
+    x[["promise"]] <- promise
+    return(promise)
+  }
+  pool <- x[["pool"]]
+  state <- notify_pool_state(pool)
+  w <- new.env(parent = emptyenv())
+  w[["kind"]] <- "map"
+  w[["map"]] <- x
+  w[["doomed"]] <- FALSE
+  # the death verdict no publish can carry: every worker live at submit
+  # gone from the registry with the runners unclaimed. No signal fires
+  # for it, so — as the sync collect's bounded registry poll — a 1 s
+  # watchdog checks while the map pends, then takes the doomed path.
+  arm_watchdog <- function() {
+    w[["timer"]] <- later::later(
+      function() {
+        if (
+          !is.null(st[["live0"]]) &&
+            st[["live0"]] > 0L &&
+            map_workers_gone(st[["pool"]])
+        ) {
+          w[["doomed"]] <- TRUE
+          if (!is.null(st[["wrap"]])) {
+            .Call(mizu_map_cancel_set, st[["wrap"]])
+          }
+          pool_drain(state)
+        } else {
+          arm_watchdog()
+        }
+      },
+      1
+    )
+    invisible()
+  }
+  w[["timer"]] <- NULL
+  # the enroll runs ahead of setting promised: a failed enroll (a stopped
+  # pool, a conflicting runner) is a call-site error and must leave the
+  # handle blocking-collectible
+  ready <- pool_enroll(state, w, st[["handles"]], st[["wrap"]])
+  x[["promised"]] <- TRUE
+  promise <- promises::promise(function(resolve, reject) {
+    w[["resolve"]] <- resolve
+    w[["reject"]] <- reject
+    if (ready) {
+      settle_waiter(w)
+    } else {
+      arm_watchdog()
+    }
+  })
+  w[["promise"]] <- promise
+  x[["promise"]] <- promise
+  promise
+}
+
+#' @rdname mizu_collect_all_async
+#' @exportS3Method promises::is.promising
+is.promising.mizu_map <- function(x) TRUE

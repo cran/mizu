@@ -1,0 +1,119 @@
+# flock / LockFileEx liveness primitive: fd-scoped, held for a process's
+# lifetime, released by the kernel on any exit path. ACQUIRED on a probe
+# means the previous holder is dead; HELD means alive.
+
+test_that("the lock excludes other open file descriptions, even in-process", {
+  skip_on_cran() # in-process flock exclusion on TMPDIR: NFS locks per process
+  lf <- tempfile()
+  h1 <- .Call(mizu:::mizu_live_open_call, lf)
+  expect_identical(.Call(mizu:::mizu_live_try_call, h1), 0L) # ACQUIRED
+
+  h2 <- .Call(mizu:::mizu_live_open_call, lf)
+  expect_identical(.Call(mizu:::mizu_live_try_call, h2), 1L) # HELD
+
+  .Call(mizu:::mizu_live_close_call, h1)
+  expect_identical(.Call(mizu:::mizu_live_try_call, h2), 0L) # holder gone
+  expect_error(.Call(mizu:::mizu_live_try_call, h1), "closed")
+})
+
+test_that("a liveness handle is tagged against other extptr types", {
+  p <- channel_pair()
+  expect_error(
+    .Call(mizu:::mizu_live_try_call, p[["host"]]),
+    "not a liveness handle"
+  )
+})
+
+test_that("lock files land in the resolved per-platform directory", {
+  dir <- .Call(mizu:::mizu_live_dir_call)
+  expect_true(dir.exists(dir))
+  p <- channel_pair()
+  suffix <- .Call(mizu:::mizu_channel_suffix, p[["host"]])
+  expect_true(file.exists(file.path(dir, sprintf("mizu_%s.live.host", suffix))))
+  expect_true(file.exists(file.path(dir, sprintf("mizu_%s.live.peer", suffix))))
+})
+
+test_that("MIZU_LIVENESS_DIR overrides the default, read-through", {
+  skip_on_cran() # a process-wide env var redirects the liveness directory
+  d <- tempfile("livedir")
+  dir.create(d)
+  old <- Sys.getenv("MIZU_LIVENESS_DIR", NA_character_)
+  Sys.setenv(MIZU_LIVENESS_DIR = d)
+  on.exit(
+    if (is.na(old)) {
+      Sys.unsetenv("MIZU_LIVENESS_DIR")
+    } else {
+      Sys.setenv(MIZU_LIVENESS_DIR = old)
+    }
+  )
+  expect_identical(.Call(mizu:::mizu_live_dir_call), d)
+  p <- channel_pair()
+  suffix <- .Call(mizu:::mizu_channel_suffix, p[["host"]])
+  expect_true(file.exists(file.path(d, sprintf("mizu_%s.live.host", suffix))))
+  expect_true(file.exists(file.path(d, sprintf("mizu_%s.live.peer", suffix))))
+})
+
+test_that("a holder's death releases the lock to a probing survivor", {
+  skip_if_no_child_mizu()
+  lf <- tfile()
+  pidfile <- tfile()
+
+  mizu:::mizu_spawn(sprintf(
+    '
+    library(mizu)
+    h <- .Call(mizu:::mizu_live_open_call, %s)
+    if (.Call(mizu:::mizu_live_try_call, h) != 0L) stop("lock busy")
+    tmp <- paste0(%s, ".tmp")
+    writeLines(as.character(Sys.getpid()), tmp)
+    file.rename(tmp, %s)
+    Sys.sleep(30)
+  ',
+    deparse(lf),
+    deparse(pidfile),
+    deparse(pidfile)
+  ))
+
+  expect_true(wait_for_file(pidfile))
+  pid <- as.integer(readLines(pidfile))
+
+  h <- .Call(mizu:::mizu_live_open_call, lf)
+  expect_identical(.Call(mizu:::mizu_live_try_call, h), 1L) # child alive
+
+  tools::pskill(pid)
+  expect_true(wait_until(.Call(mizu:::mizu_live_try_call, h) == 0L))
+})
+
+test_that("liveness handles validate their arguments", {
+  expect_error(.Call(mizu:::mizu_live_open_call, 42L), "expected a file path")
+  expect_error(
+    .Call(mizu:::mizu_live_open_call, file.path(tempfile("mizu-absent"), "x")),
+    "cannot open liveness file"
+  )
+})
+
+test_that("an unusable liveness directory fails both constructors cleanly", {
+  skip_on_cran() # OS file-creation failure paths via a process-wide env var
+  on.exit({
+    Sys.unsetenv("MIZU_LIVENESS_DIR")
+    gc() # release the regions the walked-back creates left behind
+  })
+  Sys.setenv(MIZU_LIVENESS_DIR = file.path(tempfile("mizu-absent"), "locks"))
+  expect_error(
+    .Call(mizu:::mizu_channel_create, quote(NULL), 64L, 256L, 0, FALSE),
+    "cannot lock host liveness file"
+  )
+  expect_error(
+    .Call(mizu:::mizu_pool_create, 1L, 8L, 64L, 64L, 64L, 256L),
+    "cannot create liveness file"
+  )
+  # past the 900-byte wire budget both refuse before creating anything
+  Sys.setenv(MIZU_LIVENESS_DIR = paste0("/", strrep("d", 920)))
+  expect_error(
+    .Call(mizu:::mizu_channel_create, quote(NULL), 64L, 256L, 0, FALSE),
+    "liveness directory path too long"
+  )
+  expect_error(
+    .Call(mizu:::mizu_pool_create, 1L, 8L, 64L, 64L, 64L, 256L),
+    "liveness directory path too long"
+  )
+})

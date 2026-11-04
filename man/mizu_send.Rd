@@ -10,49 +10,82 @@ mizu_send(ch, x)
 mizu_recv(ch, timeout = Inf)
 }
 \arguments{
-\item{ch}{a channel from \code{\link[=mizu_inproc_channel]{mizu_inproc_channel()}}.}
+\item{ch}{a channel handle from \code{\link[=mizu_channel]{mizu_channel()}} (or the \code{ch} binding
+inside a peer expression).}
 
 \item{x}{the payload: any R object.}
 
-\item{timeout}{seconds to wait before the call returns the
-\code{mizu_timeout} sentinel. \code{Inf} (the default) waits indefinitely,
-and \code{0} polls. The wait is a bounded spin-then-backoff poll on a
-monotonic clock: system clock adjustments do not affect it, and Ctrl-C
-stays responsive throughout.}
+\item{timeout}{seconds to wait for a message before returning the
+\code{mizu_timeout} sentinel. \code{Inf} (the default) waits indefinitely;
+\code{0} does not wait.}
 }
 \value{
 \code{mizu_send()} returns \code{TRUE} (invisibly) on success, or a
-sentinel otherwise. \code{mizu_recv()} returns the received value or a
+sentinel otherwise. \code{mizu_recv()} returns the received payload or a
 sentinel.
 }
 \description{
-\code{mizu_send()} appends \code{x} to the buffer of the channel. Sends never
-block: a send on a full channel returns the \code{mizu_full} sentinel
-immediately. \code{mizu_recv()} removes and returns the oldest buffered
-value, waiting up to \code{timeout} seconds for one to arrive.
+\code{mizu_send()} publishes a message to the peer. The message is visible as soon
+as the call returns, with no separate flush step. \code{mizu_recv()} returns the
+next message, and waits up to \code{timeout} seconds for it.
 }
 \details{
-Terminal states surface as class-tagged sentinels, not errors. Dispatch
-with \code{inherits(x, "mizu_sentinel")}, or on the specific classes:
+Sends never block for ring space. Receives report every terminal state
+as a class-tagged sentinel, not an error. Test for them with
+\code{inherits(x, "mizu_sentinel")}, or with the specific classes:
 \itemize{
-\item \code{mizu_full} — the buffer is at capacity (send). Receive first, or
-drop the value.
-\item \code{mizu_timeout} — no value arrived within \code{timeout} (recv).
-\item \code{mizu_closed} — the channel was closed with
-\code{\link[=mizu_inproc_close]{mizu_inproc_close()}}. A receive drains all buffered values before it
-reports this.
+\item \code{mizu_full} — the ring is full (send). Back off until the peer drains,
+or drop the message.
+\item \code{mizu_timeout} — no message arrived within \code{timeout} (recv).
+\item \code{mizu_closed} — the other side closed the channel. A receive drains all
+published messages before it reports this.
+\item \code{mizu_peer_gone} — the peer died without closing. Death is detected through
+the liveness lock that the kernel releases, as soon as the OS reports it. A
+receive drains first here too, since the published messages of a dead peer
+are complete and valid. Sticky once returned.
 }
 
-\code{NULL} is a legal payload. Sentinels are ordinary values, identifiable by
-class alone, and never signalled conditions. \code{\link[=mizu_is_sentinel]{mizu_is_sentinel()}}
-checks identity where payloads are untrusted.
+\code{NULL} is a legal payload. Sentinels are ordinary values identified by their
+class, never signalled conditions. \code{\link[=mizu_is_sentinel]{mizu_is_sentinel()}} checks identity where
+payloads are untrusted.
+
+\code{NULL} crosses as an immediate, with no serialization and no allocation on
+receive. A length-1 character vector that fits the inline budget crosses with
+a single byte copy, encoding mark preserved. Attribute-free non-ALTREP atomic
+vectors, and \code{integer64} vectors whose only attribute is the class, take a
+serialization-free path with a byte-identical round trip: inline within the
+budget, and past it as bare bytes in the arena or a spill region. Other plain
+values (attributed vectors, strings, lists, calls) cross as a compact binary
+stream written and read without R's serializer. Anything else is
+R-serialized. Mori-shared objects reduce to their identifiers through the
+mori hooks.
+
+A NumPy or Arrow \code{int64} array from a Python peer arrives as an \code{integer64}
+vector in bit64's layout, constructed without bit64. With bit64 loaded the
+result is fully functional, and without it the bits round-trip but print as
+raw doubles. The missing-value sentinel is shared in both directions: a
+genuine \code{INT64_MIN} reads as \code{NA_integer64_} in R, and an \code{NA_integer64_}
+arrives as \code{INT64_MIN} in Python.
+
+From a non-R peer, only vectors and strings are legal payloads. Anything else
+(a pymizu codec stream or a pickle) is declined, and the receive raises a
+classed \code{mizu_error_python_payload} error (see \link{mizu_error}). The declined
+message is consumed, so the channel keeps flowing.
+
+Large payloads can arrive as zero-copy views over shared memory. A view is a
+small R object that pins memory the garbage collector cannot see. To return
+that memory promptly, the receive functions (and worker task boundaries) run
+a minor garbage collection once 8 MiB of released view memory has
+accumulated. Re-receiving the same region does not re-trigger it. This
+is an occasional
+pause of about 0.2 ms, the largest latency outlier in the system. Set
+\code{options(mizu.gc_boundary)} (in bytes; \code{0} disables it) before loading the
+package to tune the threshold.
 }
 \examples{
-ch <- mizu_inproc_channel(1)
-mizu_send(ch, "a")
-mizu_send(ch, "b")  # full: returns the mizu_full sentinel
-mizu_recv(ch)
-mizu_recv(ch, timeout = 0)
-mizu_inproc_close(ch)
+ch <- mizu_channel(quote(mizu_send(ch, mizu_recv(ch))))
+mizu_send(ch, list(1, "a"))
+mizu_recv(ch, timeout = 5)
+mizu_close(ch)
 
 }

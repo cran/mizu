@@ -1,0 +1,868 @@
+test_that("mizu_call builds name and source specs", {
+  spec <- mizu_call("stats::quantile", 1:10, probs = c(0.25, 0.75))
+  expect_true(inherits(spec, "mizu_call"))
+  expect_identical(spec$code, "stats::quantile")
+  expect_identical(spec$kind, 0L)
+  expect_identical(spec$positional, list(1:10))
+  expect_identical(spec$named, list(probs = c(0.25, 0.75)))
+  src <- mizu_call(.source = "x + 1", x = 41L)
+  expect_identical(src$kind, 1L)
+  expect_identical(src$named, list(x = 41L))
+  expect_identical(src$positional, list())
+  expect_error(mizu_call(), "exactly one")
+  expect_error(mizu_call("f", .source = "x"), "exactly one")
+  expect_error(mizu_call(1L), "single string")
+})
+
+test_that("spec constant names never collide with the formals ahead of ...", {
+  spec <- mizu_call("fn", n = 3L)
+  expect_identical(spec$code, "fn")
+  expect_identical(spec$named, list(n = 3L))
+  src <- mizu_call(.source = "x", source = 1L)
+  expect_identical(src$code, "x")
+  expect_identical(src$named, list(source = 1L))
+})
+
+test_that("spec tasks run on a same-language pool, errors stay rich", {
+  skip_on_cran()
+  p <- mizu_pool(1L)
+  on.exit(mizu_pool_stop(p))
+  t <- mizu_submit_call(
+    p,
+    mizu_call("stats::quantile", 1:100, probs = c(0.25, 0.75), names = FALSE)
+  )
+  expect_equal(mizu_collect(t), c(25.75, 75.25))
+  s <- mizu_submit_call(p, mizu_call(.source = "y <- x * 2\ny + 1", x = 20))
+  expect_identical(mizu_collect(s), 41)
+  e <- mizu_submit_call(p, mizu_call("base::log", "x"))
+  cnd <- tryCatch(mizu_collect(e), error = function(c) c)
+  expect_false(inherits(cnd, "mizu_error_remote"))
+  expect_match(conditionMessage(cnd), "non-numeric")
+})
+
+test_that("spec name resolution: unloaded package, ::: internal, missing fn", {
+  skip_on_cran()
+  p <- mizu_pool(1L)
+  on.exit(mizu_pool_stop(p))
+  t <- mizu_submit_call(p, mizu_call("parallel::detectCores"))
+  expect_gte(mizu_collect(t), 1L)
+  i <- mizu_submit_call(p, mizu_call("utils:::head.default", 1:10, 2L))
+  expect_identical(mizu_collect(i), 1:2)
+  e <- mizu_submit_call(p, mizu_call("base::no_such_fn_xyz"))
+  expect_error(mizu_collect(e), "could not find function")
+})
+
+test_that("a spec arg that is a large re-sendable view rewrites inline", {
+  ch <- channel_pair()
+  on.exit(channel_end(ch))
+  x <- runif(20000)
+  mizu_send(ch[["host"]], x)
+  v <- mizu_recv(ch[["peer"]], 5)
+  p <- pool_pair()
+  on.exit(pool_end(p), add = TRUE)
+  t <- mizu_submit_call(p[["ctrl"]], mizu_call("base::identity", v))
+  pool_step(p)
+  expect_identical(mizu_collect(t, 5), x)
+})
+
+test_that("a zc-sized arg tree with a non-portable leaf declines at submit", {
+  p <- pool_pair()
+  on.exit(pool_end(p))
+  e <- tryCatch(
+    mizu_submit_call(
+      p[["ctrl"]],
+      mizu_call("base::identity", list(v = runif(30000), bad = function() 1))
+    ),
+    error = identity
+  )
+  expect_s3_class(e, "mizu_error_not_portable")
+  expect_identical(e$reason, "a closure has no portable home")
+})
+
+test_that("a pool no worker has joined: spec and map error, plain submit queues", {
+  ctrl <- .Call(
+    mizu:::mizu_pool_create,
+    1L,
+    8L,
+    64L,
+    64L,
+    64L,
+    512L
+  )
+  suffix <- .Call(mizu:::mizu_pool_suffix, ctrl)
+  att <- .Call(mizu:::mizu_pool_attach_call, suffix)
+  spec <- mizu_call("base::sqrt", 2)
+  expect_error(mizu_submit_call(ctrl, spec), "no worker has joined")
+  expect_error(mizu_submit_call(att, spec), "no worker has joined")
+  expect_error(
+    mizu_collect(mizu_map(ctrl, 1:3, identity)),
+    "no worker has joined"
+  )
+  expect_error(mizu_collect(mizu_map(ctrl, 1:3, spec)), "no worker has joined")
+  expect_error(mizu_map_prepare(ctrl, 1:3, identity), "no worker has joined")
+  t <- mizu_submit(ctrl, 1 + 1)
+  wk <- .Call(mizu:::mizu_pool_worker_join, suffix, 0L, NULL)
+  .Call(mizu:::mizu_pool_set_eval, wk)
+  p <- list(ctrl = ctrl, wk = wk, wks = list(wk))
+  t2 <- mizu_submit_call(ctrl, spec)
+  t3 <- mizu_submit_call(att, spec)
+  pool_step(p)
+  pool_step(p)
+  pool_step(p)
+  expect_equal(mizu_collect(t), 2)
+  expect_equal(mizu_collect(t2), sqrt(2))
+  expect_equal(mizu_collect(t3), sqrt(2))
+  pool_end(p)
+})
+
+test_that("private verbs fail fast on a foreign pool", {
+  p <- pool_pair(ident = c(3L, 7L))
+  expect_error(mizu_submit(p$ctrl, 1 + 1), "mizu_submit_call")
+  expect_error(
+    mizu_submit_batch(p$ctrl, list(quote(1 + 1))),
+    "mizu_submit_call"
+  )
+  expect_error(mizu_collect(mizu_map(p$ctrl, 1:3, identity)), "mizu_call")
+  expect_error(mizu_map_prepare(p$ctrl, 1:3, identity), "mizu_call")
+  d <- mizu_pool_dump(p$ctrl)
+  expect_identical(d[["language"]], "Python")
+  expect_identical(d[["capabilities"]], 7L)
+  pool_end(p)
+})
+
+test_that("a task targeting another language fails with a mismatch", {
+  p <- pool_pair(ident = c(3L, 7L))
+  t <- mizu_submit_call(p$ctrl, mizu_call("builtins.len", 1:3))
+  pool_step(p)
+  cnd <- tryCatch(mizu_collect(t), mizu_error_remote = function(c) c)
+  expect_s3_class(cnd, "mizu_error_remote")
+  expect_match(conditionMessage(cnd), "task language mismatch")
+  pool_end(p)
+})
+
+test_that("the qualifier check is syntax-shaped per worker language", {
+  p <- pool_pair()
+  expect_error(
+    mizu_submit_call(p$ctrl, mizu_call("length", 1:3)),
+    "qualified name"
+  )
+  pool_end(p)
+  p <- pool_pair(ident = c(3L, 7L))
+  expect_error(
+    mizu_submit_call(p$ctrl, mizu_call("stats::quantile", 1:3)),
+    "qualified name"
+  )
+  expect_error(
+    mizu_submit_call(p$ctrl, mizu_call("numpy.mean", environment())),
+    class = "mizu_error_not_portable"
+  )
+  pool_end(p)
+})
+
+test_that("foreign-submitter tasks: results, err streams, the result gate", {
+  p <- pool_pair()
+  submit <- function(spec, ident) {
+    .Call(mizu:::mizu_pool_submit_spec, p$ctrl, spec, Inf, ident)
+  }
+  t1 <- submit(mizu_call("base::sqrt", 16), c(3L, 7L))
+  t2 <- submit(mizu_call(.source = "stop(\"boom\")"), c(3L, 7L))
+  t3 <- submit(mizu_call(.source = "lm(mpg ~ wt, mtcars)"), c(3L, 7L))
+  t4 <- submit(mizu_call("base::sqrt", 25), c(3L, 15L))
+  pool_step(p)
+  pool_step(p)
+  pool_step(p)
+  pool_step(p)
+  expect_identical(mizu_collect(t1), 4)
+  c2 <- tryCatch(mizu_collect(t2), mizu_error_remote = function(c) c)
+  expect_s3_class(c2, "mizu_error_remote")
+  expect_equal(c2$remote_type, "simpleError")
+  expect_match(c2$message, "boom")
+  c3 <- tryCatch(mizu_collect(t3), mizu_error_remote = function(c) c)
+  expect_s3_class(c3, "mizu_error_remote")
+  expect_equal(c3$remote_type, "mizu_error_not_portable")
+  expect_match(c3$message, "not portable")
+  # unknown capability bits in the submitter identity are ignored
+  expect_identical(mizu_collect(t4), 5)
+  pool_end(p)
+})
+
+test_that("a by-reference spec argument needs the worker's ref capability", {
+  skip_on_os("linux") # a held view trips the churn fallback there
+  ch <- channel_pair(arena_size = 0)
+  x <- runif(100000)
+  mizu_send(ch[["host"]], x)
+  v <- mizu_recv(ch[["peer"]], 5)
+  # layout bits without TASKREF: the by-reference argument fails locally
+  p <- pool_pair(ident = c(9L, 7L))
+  expect_error(
+    .Call(
+      mizu:::mizu_pool_submit_spec,
+      p$ctrl,
+      mizu_call("base::sum", v),
+      Inf,
+      NULL
+    ),
+    "by-reference task arguments"
+  )
+  pool_end(p)
+
+  p <- pool_pair()
+  t <- .Call(
+    mizu:::mizu_pool_submit_spec,
+    p$ctrl,
+    mizu_call("base::sum", v),
+    Inf,
+    NULL
+  )
+  pool_step(p)
+  expect_identical(mizu_collect(t, 5), sum(x))
+  # a ref plus a zc candidate: the candidate stages a region, the ref pins
+  y <- runif(9000)
+  t2 <- .Call(
+    mizu:::mizu_pool_submit_spec,
+    p$ctrl,
+    mizu_call("base::list", v, y),
+    Inf,
+    NULL
+  )
+  pool_step(p)
+  out <- mizu_collect(t2, 5)
+  expect_identical(out[[1L]], x)
+  expect_identical(out[[2L]], y)
+  pool_end(p)
+  channel_end(ch)
+})
+
+test_that("a spec past the inline budget spills to a region", {
+  p <- pool_pair()
+  spec <- do.call(mizu_call, c("base::list", as.list(seq_len(300L))))
+  t <- mizu_submit_call(p$ctrl, spec)
+  pool_step(p)
+  expect_identical(mizu_collect(t, 5), as.list(seq_len(300L)))
+  pool_end(p)
+})
+
+test_that("a large foreign result is a view only when caps admit", {
+  p <- pool_pair()
+  x <- strrep("abcdefghij", 10000)
+  spec <- mizu_call(.source = "strrep(\"abcdefghij\", 10000)")
+  t1 <- .Call(mizu:::mizu_pool_submit_spec, p$ctrl, spec, Inf, c(3L, 7L))
+  t2 <- .Call(mizu:::mizu_pool_submit_spec, p$ctrl, spec, Inf, c(3L, 0L))
+  pool_step(p)
+  pool_step(p)
+  v1 <- mizu_collect(t1)
+  v2 <- mizu_collect(t2)
+  expect_true(.Call(mizu:::mizu_zc_view_check, v1))
+  expect_false(.Call(mizu:::mizu_zc_view_check, v2))
+  expect_identical(v1, x)
+  expect_identical(v2, x)
+  pool_end(p)
+})
+
+test_that("a foreign private frame gets the neutral err stream", {
+  p <- pool_pair()
+  t1 <- .Call(mizu:::mizu_pool_submit, p$ctrl, charToRaw("Ptask"), Inf, 0L)
+  t2 <- .Call(
+    mizu:::mizu_pool_submit,
+    p$ctrl,
+    as.raw(c(0x80, 0x04, 0x00)),
+    Inf,
+    0L
+  )
+  pool_step(p)
+  pool_step(p)
+  c1 <- tryCatch(mizu_collect(t1), mizu_error_remote = function(c) c)
+  c2 <- tryCatch(mizu_collect(t2), mizu_error_remote = function(c) c)
+  expect_s3_class(c1, "mizu_error_remote")
+  expect_s3_class(c2, "mizu_error_remote")
+  expect_match(c1$message, "foreign private codec")
+  expect_match(c2$message, "foreign private codec")
+  pool_end(p)
+})
+
+test_that("a wrong-shape task stream fails naming the shape", {
+  p <- pool_pair()
+  # the corpus fixture with the target and submitter bytes patched to
+  # R workers and a Python submitter
+  b <- ix_hex_to_raw(ix_corpus()[["err-taskdec-shape"]])
+  b[4L] <- as.raw(2L)
+  b[8L] <- as.raw(3L)
+  t <- .Call(mizu:::mizu_pool_submit, p$ctrl, b, Inf, 0L)
+  pool_step(p)
+  cnd <- tryCatch(mizu_collect(t), mizu_error_remote = function(c) c)
+  expect_s3_class(cnd, "mizu_error_remote")
+  expect_match(cnd$message, "the code field is not a string")
+  pool_end(p)
+})
+
+test_that("a valid foreign task stream executes (corpus bytes)", {
+  p <- pool_pair()
+  b <- ix_hex_to_raw(ix_corpus()[["task-name-py2r"]])
+  t <- .Call(mizu:::mizu_pool_submit, p$ctrl, b, Inf, 0L)
+  pool_step(p)
+  expect_identical(mizu_collect(t), c(1.5, 2, 2.5))
+  pool_end(p)
+})
+
+test_that("a foreign task nests a same-language submit", {
+  p <- pool_pair()
+  src <- paste0(
+    "t <- mizu_submit(mizu_current_pool(), x * 2, x = 21L)\n",
+    "mizu_collect(t)"
+  )
+  t <- .Call(
+    mizu:::mizu_pool_submit_spec,
+    p$ctrl,
+    mizu_call(.source = src),
+    Inf,
+    c(3L, 7L)
+  )
+  pool_step(p)
+  expect_identical(mizu_collect(t), 42)
+  pool_end(p)
+})
+
+test_that("a nested submit keeps the outer task's foreign identity", {
+  p <- pool_pair()
+  submit <- function(spec) {
+    .Call(mizu:::mizu_pool_submit_spec, p$ctrl, spec, Inf, c(3L, 7L))
+  }
+  nested <- paste(
+    "t <- mizu_submit(mizu_current_pool(), x * 2, x = 21L)",
+    "mizu_collect(t)",
+    sep = "\n"
+  )
+  src <- function(tail) paste(nested, tail, sep = "\n")
+  t1 <- submit(mizu_call(.source = src("list(a = 1, b = 'x')")))
+  t2 <- submit(mizu_call(.source = src("stop('boom')")))
+  t3 <- submit(mizu_call(.source = src("function(x) x")))
+  pool_step(p)
+  pool_step(p)
+  pool_step(p)
+  # the nested help-collect must not clobber the outer task's submitter
+  # identity: the outer task keeps the foreign result and err formats
+  expect_identical(mizu_collect(t1), list(a = 1, b = "x"))
+  c2 <- tryCatch(mizu_collect(t2), mizu_error_remote = function(c) c)
+  expect_s3_class(c2, "mizu_error_remote")
+  expect_equal(c2$remote_type, "simpleError")
+  c3 <- tryCatch(mizu_collect(t3), mizu_error_remote = function(c) c)
+  expect_s3_class(c3, "mizu_error_remote")
+  expect_equal(c3$remote_type, "mizu_error_not_portable")
+  pool_end(p)
+})
+
+test_that("collect_any and collect_all cross languages", {
+  p <- pool_pair()
+  submit <- function(spec) {
+    .Call(mizu:::mizu_pool_submit_spec, p$ctrl, spec, Inf, c(3L, 7L))
+  }
+  t1 <- submit(mizu_call(.source = "1 + 1"))
+  t2 <- submit(mizu_call(.source = "stop(\"boom\")"))
+  pool_step(p)
+  pool_step(p)
+  r <- mizu_collect_any(list(t1, t2))
+  expect_identical(r[["index"]], 1L)
+  expect_identical(r[["value"]], 2)
+  t3 <- submit(mizu_call(.source = "1 + 1"))
+  t4 <- submit(mizu_call(.source = "stop(\"boom\")"))
+  pool_step(p)
+  pool_step(p)
+  cnd <- tryCatch(
+    mizu_collect_all(list(t3, t4)),
+    mizu_error_remote = function(c) c
+  )
+  expect_s3_class(cnd, "mizu_error_remote")
+  expect_equal(cnd[["index"]], 2L)
+  expect_identical(mizu_collect(t3), 2)
+  pool_end(p)
+})
+
+test_that("task arguments cross by reference: the SHM_VEC stage and the REF re-send", {
+  skip_on_cran() # a refcount drop rides a finalizer at gc()
+  p <- pool_pair()
+  on.exit(pool_end(p))
+  big <- runif(200000L) # 1.6 MB — past the zero-copy floor
+  t1 <- mizu_submit_call(p$ctrl, mizu_call("base::mean", big))
+  pool_step(p)
+  expect_equal(mizu_collect(t1), mean(big))
+
+  # a received view re-sent as an argument: REFHELD set, the loan balanced
+  ch <- channel_pair(capacity = 128L, slot_size = 512L, arena_size = 8192)
+  mizu_send(ch$host, big)
+  xv <- mizu_recv(ch$peer, Inf)
+  expect_true(.Call(mizu:::mizu_zc_view_check, xv))
+  rc0 <- .Call(mizu:::mizu_zc_refcount, xv)
+  t2 <- mizu_submit_call(p$ctrl, mizu_call("base::mean", xv))
+  pool_step(p)
+  expect_equal(mizu_collect(t2), mean(big))
+  gc() # the worker's argument loan rides the view's release record
+  rc1 <- .Call(mizu:::mizu_zc_refcount, xv)
+  expect_identical(rc1[2L], 1L) # REFHELD
+  expect_identical(rc1[1L], rc0[1L])
+  channel_end(ch)
+})
+
+test_that("multiple ref args and a nested view cross, loans balanced", {
+  skip_on_cran() # a refcount drop rides a finalizer at gc()
+  p <- pool_pair()
+  on.exit(pool_end(p))
+  ch <- channel_pair(capacity = 128L, slot_size = 512L, arena_size = 8192)
+  a <- runif(100000L)
+  b <- runif(100000L)
+  mizu_send(ch$host, a)
+  va <- mizu_recv(ch$peer, Inf)
+  mizu_send(ch$host, b)
+  vb <- mizu_recv(ch$peer, Inf)
+  rc0a <- .Call(mizu:::mizu_zc_refcount, va)[1L]
+  rc0b <- .Call(mizu:::mizu_zc_refcount, vb)[1L]
+  # two positional, a named, and views nested inside list args
+  t <- mizu_submit_call(
+    p$ctrl,
+    mizu_call(
+      NULL,
+      va,
+      vb,
+      x = list(va),
+      y = vb,
+      .source = "gc(); sum(..1) + sum(..2) + sum(x[[1]]) + sum(y)"
+    )
+  )
+  pool_step(p)
+  expect_equal(mizu_collect(t), sum(a) + sum(b) + sum(a) + sum(b))
+  gc() # the workers' argument loans ride the views' release records
+  expect_identical(.Call(mizu:::mizu_zc_refcount, va)[1L], rc0a)
+  expect_identical(.Call(mizu:::mizu_zc_refcount, vb)[1L], rc0b)
+  channel_end(ch)
+})
+
+test_that("a list-tree view arg resolves to the element view", {
+  p <- pool_pair()
+  on.exit(pool_end(p))
+  ch <- channel_pair(capacity = 128L, slot_size = 512L, arena_size = 8192)
+  big <- replicate(2000L, runif(100L), simplify = FALSE)
+  mizu_send(ch$host, big)
+  lv <- mizu_recv(ch$peer, Inf)
+  expect_true(.Call(mizu:::mizu_zc_view_check, lv))
+  ev <- lv[[2L]]
+  expect_true(.Call(mizu:::mizu_zc_view_check, ev))
+  expect_true(grepl("[", .Call(mizu:::mizu_zc_view_name, ev), fixed = TRUE))
+  t <- mizu_submit_call(p$ctrl, mizu_call("base::mean", ev))
+  pool_step(p)
+  expect_equal(mizu_collect(t), mean(big[[2L]]))
+  channel_end(ch)
+})
+
+test_that("result-is-the-arg keeps the loan through the publish (D5)", {
+  skip_on_cran() # a refcount drop rides a finalizer at gc()
+  p <- pool_pair()
+  on.exit(pool_end(p))
+  ch <- channel_pair(capacity = 128L, slot_size = 512L, arena_size = 8192)
+  big <- runif(100000L)
+  mizu_send(ch$host, big)
+  xv <- mizu_recv(ch$peer, Inf)
+  rc0 <- .Call(mizu:::mizu_zc_refcount, xv)
+  t <- mizu_submit_call(p$ctrl, mizu_call("base::identity", xv))
+  pool_step(p)
+  res <- mizu_collect(t)
+  expect_true(.Call(mizu:::mizu_zc_view_check, res))
+  # the write emitted the ref, so the view kept its loan; the count
+  # elevates by the submitter's own add — no zero window (the worker's
+  # result pin drops at its next keeper sweep, the view's at GC)
+  pool_step(p) # the empty step drives the idle sweep
+  gc()
+  expect_identical(.Call(mizu:::mizu_zc_refcount, res)[1L], rc0[1L] + 1L)
+  expect_identical(res, big)
+  channel_end(ch)
+})
+
+test_that("the emitted set keeps loans: attribute and condition-field probes", {
+  skip_on_cran() # a refcount drop rides a finalizer at gc()
+  p <- pool_pair()
+  on.exit(pool_end(p))
+  ch <- channel_pair(capacity = 128L, slot_size = 512L, arena_size = 8192)
+  big <- runif(100000L)
+  mizu_send(ch$host, big)
+  xv <- mizu_recv(ch$peer, Inf)
+  rc0 <- .Call(mizu:::mizu_zc_refcount, xv)
+
+  # the argument view rides the result in an attribute: the attr blob's
+  # emission keeps the loan — the view arrives intact, refcounts balanced
+  t1 <- mizu_submit_call(
+    p$ctrl,
+    mizu_call(NULL, xv, .source = "structure(list(42), payload = ..1)")
+  )
+  pool_step(p)
+  r1 <- mizu_collect(t1)
+  pool_step(p) # the empty step drives the idle sweep
+  gc()
+  expect_identical(.Call(mizu:::mizu_zc_refcount, xv)[1L], rc0[1L] + 1L)
+  expect_identical(attr(r1, "payload"), big)
+
+  # the argument view rides a raised condition's field: the flatten's
+  # codec gate drops it, and the release pass frees the loan anyway (the
+  # baseline re-reads the count: the collected r1 view above lives on)
+  rc0 <- .Call(mizu:::mizu_zc_refcount, xv)
+  t2 <- mizu_submit_call(
+    p$ctrl,
+    mizu_call(
+      NULL,
+      xv,
+      .source = paste(
+        "stop(structure(list(message = \"boom\", payload = ..1),",
+        "class = c(\"myerr\", \"error\", \"condition\")))"
+      )
+    )
+  )
+  pool_step(p)
+  c2 <- tryCatch(mizu_collect(t2), error = function(e) e)
+  expect_match(conditionMessage(c2), "boom")
+  expect_true("payload" %in% c2[["dropped_fields"]])
+  pool_step(p) # the empty step drives the idle sweep
+  gc()
+  expect_identical(.Call(mizu:::mizu_zc_refcount, xv)[1L], rc0[1L])
+  channel_end(ch)
+})
+
+test_that("a task that keeps its argument view keeps the loan (R-01)", {
+  p <- pool_pair()
+  on.exit(pool_end(p))
+  on.exit(
+    if (exists("keep", envir = globalenv())) rm(keep, envir = globalenv()),
+    add = TRUE
+  )
+  x1 <- as.double(sample(1e5))
+  t1 <- mizu_submit_call(
+    p$ctrl,
+    mizu_call(.source = "keep <<- x; length(x)", x = x1)
+  )
+  pool_step(p)
+  expect_identical(mizu_collect(t1, timeout = 5), 100000L)
+  expect_true(.Call(mizu:::mizu_zc_view_check, keep))
+  # the loan stays GC-gated (not force-fired at the outcome write), so a
+  # same-size task cannot recycle the region under the kept view
+  rc0 <- .Call(mizu:::mizu_zc_refcount, keep)
+  expect_gte(rc0[1L], 1L)
+  t2 <- mizu_submit_call(
+    p$ctrl,
+    mizu_call(.source = "length(x)", x = rev(x1) * 2)
+  )
+  pool_step(p)
+  expect_identical(mizu_collect(t2, timeout = 5), 100000L)
+  expect_true(.Call(mizu:::mizu_zc_view_check, keep))
+  expect_identical(sum(keep), sum(x1))
+  rm(keep, envir = globalenv()) # the task's <<- lands outside the test env
+  # an unkept argument's loan rides the view's ordinary release record
+  t3 <- mizu_submit_call(p$ctrl, mizu_call("base::mean", x1))
+  pool_step(p)
+  expect_equal(mizu_collect(t3, timeout = 5), mean(x1))
+})
+
+test_that("a ref candidate to a pool without TASKREF declines locally", {
+  p <- pool_pair(ident = c(2L, 7L)) # R workers without the ref reader
+  on.exit(pool_end(p))
+  big <- runif(200000L)
+  expect_snapshot(
+    mizu_submit_call(p$ctrl, mizu_call("base::mean", big)),
+    error = TRUE
+  )
+  # an ordinary argument submits unchanged
+  t <- mizu_submit_call(p$ctrl, mizu_call("base::mean", 1:10))
+  pool_step(p)
+  expect_equal(mizu_collect(t), 5.5)
+})
+
+test_that("a view whose layout the peer cannot read crosses by value", {
+  p <- pool_pair(ident = c(2L, 13L)) # TASKREF without ATTRS
+  on.exit(pool_end(p))
+  m <- matrix(runif(200000L), nrow = 400L)
+  t <- mizu_submit_call(p$ctrl, mizu_call("base::mean", m))
+  pool_step(p)
+  expect_equal(mizu_collect(t), mean(m))
+})
+
+test_that("a ref to a vanished region fails the task informatively", {
+  p <- pool_pair()
+  on.exit(pool_end(p))
+  id <- if (.Platform[["OS.type"]] == "windows") {
+    "Local\\\\mizu_0_0" # notation-escaped; parses to Local\mizu_0_0
+  } else {
+    "/mizu_0_0"
+  }
+  x <- ix_parse(paste0(
+    "task(2, 0, 30064771075, str(\"base::mean\"), ",
+    "list(ref(\"",
+    id,
+    "\")), dict())"
+  ))
+  # a hand-crafted task stream rides a RAWVEC entry to the worker's
+  # task-stream dispatch
+  buf <- ix_hex_to_raw(ix_write_task(x))
+  t <- .Call(mizu:::mizu_pool_submit_try, p$ctrl, buf, Inf, 0L)
+  pool_step(p)
+  cnd <- tryCatch(mizu_collect(t), mizu_error_remote = function(c) c)
+  expect_s3_class(cnd, "mizu_error_remote")
+  expect_match(cnd[["message"]], "not found")
+})
+
+test_that("the no_zc degrade writes a large argument by value", {
+  big <- runif(100000L)
+  x <- list(
+    target = 2L,
+    kind = 0L,
+    ident = 30064771075,
+    code = "base::mean",
+    positional = list(big),
+    named = list()
+  )
+  # without a live stage there is no checkout either way — by value
+  expect_identical(ix_write_task(x, no_zc = TRUE), ix_write_task(x))
+})
+
+test_that("a view x crosses as a ref on a spec map, read off the pages (D6)", {
+  skip_on_cran() # finalizer-driven, polled against a wall-clock deadline
+  p <- pool_pair()
+  on.exit(pool_end(p))
+  big <- runif(100000L)
+  ch <- channel_pair(capacity = 128L, slot_size = 512L, arena_size = 8192)
+  mizu_send(ch$host, big)
+  xv <- mizu_recv(ch$peer, Inf)
+  rc0 <- .Call(mizu:::mizu_zc_refcount, xv)
+  st <- mizu:::map_stage(p$ctrl, xv, mizu_call("base::sqrt"), list())
+  mizu:::map_submit(p$ctrl, st)
+  while (pool_step(p) == 1L) {
+    NULL
+  }
+  res <- mizu:::map_collect(st, deadline = mizu:::mono_time() + 30)
+  expect_equal(unlist(res), sqrt(big))
+  rc1 <- .Call(mizu:::mizu_zc_refcount, xv)
+  expect_identical(rc1[2L], 1L) # REFHELD
+  # the worker's map-context view releases at the idle sweep
+  expect_true(wait_until({
+    gc()
+    .Call(mizu:::mizu_zc_refcount, xv)[1L] == rc0[1L]
+  }))
+  channel_end(ch)
+})
+
+test_that("mizu_submit_call validates the spec and the name shape", {
+  expect_error(mizu_submit_call(NULL, list()), "must be a mizu_call")
+  expect_error(mizu_submit_call(NULL, "base::sqrt"), "must be a mizu_call")
+  p <- pool_pair()
+  expect_error(
+    mizu_submit_call(p$ctrl, mizu_call("base::1bad", 1:3)),
+    "qualified name"
+  )
+  pool_end(p)
+})
+
+test_that("the zc-selection fold matches the legacy loop: candidate matrix", {
+  skip_on_cran() # ten pool regions, MBs of R hex encoding: slow under valgrind
+  # a fresh pool_pair per row: a pool's first zc submit always selects
+  # (the lent-region ledger is empty), keeping the rows deterministic
+  # under the Linux churn fallback
+  ident <- c(2L, 8L) # TASKREF only: the exact-model caps
+  p <- pool_pair(ident = ident)
+  inline_max <- ix_inline_max(p)
+  pool_end(p)
+  # the model's selection, the live view flags, and the values all agree
+  run <- function(positional, named, paths, want_sel) {
+    p <- pool_pair(ident = ident)
+    on.exit(pool_end(p))
+    got <- ix_run_probe(p, positional, named, paths, inline_max)
+    expect_identical(got$expected, want_sel)
+    want <- rep(FALSE, length(got$flags))
+    if (want_sel > 0L) {
+      want[want_sel] <- TRUE
+    }
+    expect_identical(got$flags, want)
+    expect_true(got$sum_ok)
+  }
+  cand <- runif(5120L) # 40960 bytes — past the floor
+
+  # k = 1, the boundary exact: adjusted == inline_max selects (the fit is
+  # inclusive); adjusted == inline_max + 1 stays by value
+  spec_total <- function(positional) {
+    x <- list(
+      target = 2L,
+      kind = 1L,
+      ident = 30064771075,
+      code = ix_probe_src("..1"),
+      positional = positional,
+      named = list()
+    )
+    nchar(ix_write_task(x)) %/% 2L
+  }
+  t_tot <- inline_max + ix_node_size(cand) - ix_reserve
+  fill <- strrep("a", t_tot - spec_total(list(cand, "")))
+  stopifnot(spec_total(list(cand, fill)) == t_tot)
+  run(list(cand, fill), list(), "..1", 1L)
+  run(list(cand, paste0(fill, "a")), list(), "..1", 0L)
+
+  # k = 1 at the middle and tail positions, and nested in a list
+  run(list(runif(3L), cand, "x"), list(), "..2", 1L)
+  run(list(runif(3L)), list(n1 = cand), "n1", 1L)
+  run(list(list(runif(3L), cand)), list(), "..1[[2]]", 1L)
+
+  # k >= 2 never selects (each adjusted total carries the other candidates
+  # by value); 17 candidates exercise the record cap
+  run(list(cand, runif(25000L)), list(), c("..1", "..2"), 0L)
+  c17 <- lapply(seq_len(17L), function(i) runif(5120L + i))
+  run(c17, list(), sprintf("..%d", seq_len(17L)), 0L)
+
+  # k = 0, inline and spilled by-value totals
+  run(list(runif(3L), "abc"), list(), character(0L), 0L)
+  run(list(runif(100L)), list(n1 = strrep("y", 30000L)), character(0L), 0L)
+})
+
+test_that("the zc-selection fold matches the legacy loop: randomized specs", {
+  skip_on_cran() # 24 randomized specs, tens of MB: minutes under valgrind
+  # one fresh pool_pair per spec — the first-submit guarantee (above)
+  ident <- c(2L, 8L) # TASKREF only: the exact-model caps
+  p <- pool_pair(ident = ident)
+  inline_max <- ix_inline_max(p)
+  pool_end(p)
+  run_one <- function(spec) {
+    p <- pool_pair(ident = ident)
+    on.exit(pool_end(p))
+    ix_run_probe(
+      p,
+      spec$positional,
+      spec$named,
+      spec$paths,
+      inline_max
+    )
+  }
+  set.seed(20261004)
+  for (i in seq_len(24L)) {
+    got <- run_one(ix_gen_spec(inline_max))
+    want <- rep(FALSE, length(got$flags))
+    if (got$expected > 0L) {
+      want[got$expected] <- TRUE
+    }
+    expect_identical(got$flags, want)
+    expect_true(got$sum_ok)
+  }
+})
+
+test_that("the fold with full caps selects list trees and string vectors", {
+  # one fresh pool_pair per pair — the first-submit guarantee (above)
+  lst <- list(runif(3L), runif(5120L))
+  p <- pool_pair()
+  t <- mizu_submit_call(
+    p$ctrl,
+    mizu_call(
+      NULL,
+      lst,
+      .source = "list(.Call(mizu:::mizu_zc_view_check, ..1), sum(..1[[2]]))"
+    )
+  )
+  pool_step(p)
+  got <- mizu_collect(t)
+  pool_end(p)
+  expect_identical(got[[1L]], TRUE)
+  expect_equal(got[[2L]], sum(lst[[2L]]))
+  sv <- rep(strrep("z", 40000L), 3L)
+  p <- pool_pair()
+  t <- mizu_submit_call(
+    p$ctrl,
+    mizu_call(
+      NULL,
+      sv,
+      .source = "list(.Call(mizu:::mizu_zc_view_check, ..1), sum(nchar(..1)))"
+    )
+  )
+  pool_step(p)
+  got <- mizu_collect(t)
+  pool_end(p)
+  expect_identical(got[[1L]], TRUE)
+  expect_identical(got[[2L]], sum(nchar(sv)))
+})
+
+test_that("a duplicate dict key in a task stream fails the decode", {
+  for (spec in list(
+    mizu_call("base::list", aaa = 1, bbb = 2),
+    mizu_call(.source = "aaa + bbb", aaa = 1, bbb = 2)
+  )) {
+    p <- pool_pair()
+    b <- .Call(
+      mizu:::mizu_interop_write_task_call,
+      spec,
+      2L,
+      3 + 7 * 2^32,
+      FALSE
+    )
+    pos <- tail(
+      Filter(
+        function(i) all(b[i:(i + 2L)] == charToRaw("b")),
+        seq_len(length(b) - 2L)
+      ),
+      1L
+    )
+    b[pos:(pos + 2L)] <- charToRaw("aaa")
+    t <- .Call(mizu:::mizu_pool_submit, p$ctrl, b, Inf, 0L)
+    pool_step(p)
+    cnd <- tryCatch(mizu_collect(t, 5), mizu_error_remote = function(c) c)
+    expect_s3_class(cnd, "mizu_error_remote")
+    expect_match(conditionMessage(cnd), "duplicate dict key")
+    pool_end(p)
+  }
+})
+
+test_that("an unqualified task name fails the decode", {
+  p <- pool_pair()
+  b <- .Call(
+    mizu:::mizu_interop_write_task_call,
+    mizu_call("base::sqrt", 4),
+    2L,
+    3 + 7 * 2^32,
+    FALSE
+  )
+  pos <- which(b == charToRaw(":"))[1L]
+  b[pos] <- charToRaw("x") # "base::sqrt" -> "basex:sqrt"
+  t <- .Call(mizu:::mizu_pool_submit, p$ctrl, b, Inf, 0L)
+  pool_step(p)
+  cnd <- tryCatch(mizu_collect(t, 5), mizu_error_remote = function(c) c)
+  expect_s3_class(cnd, "mizu_error_remote")
+  expect_match(conditionMessage(cnd), "not qualified")
+  pool_end(p)
+})
+
+test_that("a task stream with trailing bytes fails the decode", {
+  p <- pool_pair()
+  b <- .Call(
+    mizu:::mizu_interop_write_task_call,
+    mizu_call("base::sqrt", 4),
+    2L,
+    3 + 7 * 2^32,
+    FALSE
+  )
+  t <- .Call(mizu:::mizu_pool_submit, p$ctrl, c(b, as.raw(0L)), Inf, 0L)
+  pool_step(p)
+  cnd <- tryCatch(mizu_collect(t, 5), mizu_error_remote = function(c) c)
+  expect_s3_class(cnd, "mizu_error_remote")
+  pool_end(p)
+})
+
+test_that("a spec carrying a reference pins it across the tiers", {
+  pc <- channel_pair()
+  mizu_send(pc[["host"]], runif(100000))
+  v <- mizu_recv(pc[["peer"]], 5)
+  x <- runif(10000)
+  p <- pool_pair()
+  t1 <- mizu_submit_call(
+    p[["ctrl"]],
+    mizu_call("base::list", v, strrep("x", 2000))
+  )
+  t2 <- mizu_submit_call(p[["ctrl"]], mizu_call("base::sum", x))
+  t3 <- mizu_submit_call(p[["ctrl"]], mizu_call("base::sum", v))
+  t4 <- mizu_submit_call(p[["ctrl"]], mizu_call("base::list", x, v))
+  while (pool_step(p) == 1L) {
+    NULL
+  }
+  expect_identical(mizu_collect(t1, 5)[[2L]], strrep("x", 2000))
+  expect_equal(mizu_collect(t2, 5), sum(x))
+  expect_equal(mizu_collect(t3, 5), sum(v))
+  expect_equal(mizu_collect(t4, 5)[[1L]], x)
+  pool_end(p)
+  channel_end(pc)
+})

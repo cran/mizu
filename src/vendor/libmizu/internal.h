@@ -1,0 +1,725 @@
+/* internal.h — libmizu cross-TU internals
+
+   Not installed, not FFI-stable, no ABI discipline: this header changes
+   freely. -fvisibility=hidden keeps these symbols out of the shared
+   library; the amalgamation folds it in.
+
+   Consumers: the core's own TUs only. The binding-author surface is
+   include/mizu_ext.h (installed, version-pinned per minor release) — a
+   binding never includes this header. The two headers share the
+   offset-math accessors by inclusion: the dual-form static inlines used
+   below come from mizu_ext.h, so core and binding can never drift.
+
+   Macros and static inline are fine here (no FFI to reach them). */
+
+#ifndef MIZU_INTERNAL_H
+#define MIZU_INTERNAL_H
+
+#include <string.h>
+#if !defined(_WIN32)
+#  include <sys/types.h>          /* mode_t: mizu_shm_os_open */
+#endif
+#if defined(__linux__)
+#  include <sys/mman.h>
+/* The madvise codes the region layer gates on are fixed kernel ABI, but
+   their names postdate some shipping libc headers (glibc 2.35 and 2.37;
+   a manylinux_2_28 build host has neither). Defined here, after the
+   real header, so every core TU compiles the same paths whatever its
+   headers: support is a kernel property, probed at run time — an older
+   kernel EINVALs into the existing fallbacks. */
+#  ifndef MADV_POPULATE_WRITE
+#    define MADV_POPULATE_WRITE 23   /* kernel >= 5.14 */
+#  endif
+#  ifndef MADV_COLLAPSE
+#    define MADV_COLLAPSE 25         /* kernel >= 6.1 */
+#  endif
+#endif
+
+#include "mizu.h"
+#include "mizu_ext.h"
+
+/* Some static inlines below go unused in some TUs; the amalgamation
+   folds this header into the single mizu.c TU, where they would trip
+   -Wunused-function (header inlines are exempt only in a real header). */
+#if defined(__GNUC__) || defined(__clang__)
+#  define MIZU_MAYBE_UNUSED __attribute__((unused))
+#else
+#  define MIZU_MAYBE_UNUSED
+#endif
+
+// Common -------------------------------------------------------------------------
+
+/* Power-of-two test for the create/validate option gates. */
+static inline MIZU_MAYBE_UNUSED int mizu_pow2_u64(uint64_t v) {
+  return v != 0 && (v & (v - 1)) == 0;
+}
+
+// Region layer internals ---------------------------------------------------------
+
+/* macOS registry dir: "<dir>/mizu". The liveness dir env override: */
+#define MIZU_LIVENESS_DIR_ENV "MIZU_LIVENESS_DIR"
+
+/* Stack forms (the public API is the heap form). create returns an
+   mizu_errcat (MIZU_ERRCAT_NONE on success); open returns 0/-1. */
+int mizu_shm_create_stack(mizu_shm *shm, size_t size);
+int mizu_shm_open_stack(mizu_shm *shm, const char *name);
+/* Heap forms without the error-slot record (the public verbs add it):
+   create_heap returns an mizu_errcat; open_heap returns NULL on failure. */
+int mizu_shm_create_heap(mizu_shm **out, size_t size);
+mizu_shm *mizu_shm_open_heap(const char *name);
+/* Writable-attach stack form (shm_rw.c): both sides write the control
+   regions, so peers map read-write; populate pre-faults. */
+int mizu_shm_open_rw_stack(mizu_shm *shm, const char *name, int populate);
+mizu_shm *mizu_shm_open_rw_heap(const char *name, int populate);
+/* The OS-level shm open (shm.c, POSIX only), shared by every open path:
+   Linux goes through /dev/shm directly to avoid the -lrt link dependency
+   that shm_open/shm_unlink would introduce; macOS has them in libc. */
+#ifndef _WIN32
+int mizu_shm_os_open(const char *name, int flags, mode_t mode);
+#endif
+/* Unmaps only (never frees the struct); unlink != 0 also removes the
+   name. The public mizu_shm_close wraps this + free. */
+void mizu_shm_close_stack(mizu_shm *shm, int unlink);
+
+/* The THP extent MADV_COLLAPSE works in (the PMD unit): its congruence
+   gate validates each 2 MiB extent, so collapse lengths round down to
+   whole extents and collapse-worthy mappings must be extent-aligned. */
+#define MIZU_HUGE_EXTENT ((size_t) 2 << 20)
+
+/* mmap `size` bytes of fd (offset 0) — extent-aligned on Linux (shm.c):
+   shmem hands out the kernel's unaligned pick under the stock
+   shmem_enabled=[never], which fails MADV_COLLAPSE's congruence gate.
+   The plain mmap off Linux, for sub-extent sizes, and on any reservation
+   failure: alignment is an optimization, never a failure mode. */
+void *mizu_mmap_aligned(int fd, size_t size, int prot, int flags);
+
+/* The open forms' name copy: NUL-terminated, length stamped. A name past
+   the buffer is refused (-1) rather than truncated — a truncated copy
+   would open the caller's region but name another at close-with-unlink.
+   The public open wrappers record their own message on the refusal, so
+   no errno is set. Wire-carried names are bounded by their validators;
+   this guards the public region verbs. */
+static inline MIZU_MAYBE_UNUSED int mizu_shm_set_name(mizu_shm *shm,
+                                                     const char *name) {
+  size_t nl = strlen(name);
+  if (nl >= sizeof(shm->name)) return -1;
+  memcpy(shm->name, name, nl);
+  shm->name[nl] = '\0';
+  shm->name_len = (uint8_t) nl;
+  return 0;
+}
+
+/* macOS registry-log exit/unload hook (shm.c; defined under __APPLE__
+   only): removes this process's log and prunes the registry dir once
+   every created region is torn down. Registered as a library
+   destructor; declared here for the unit tier. */
+void mizu_log_teardown(void);
+
+/* Control-region create: pre-faulted on every platform, so slot walks
+   never zero-fill-fault on the hot path. Payload regions use the plain
+   create — written in full at stage time. */
+int mizu_shm_create_populate(mizu_shm *shm, size_t size);
+
+/* SHM_RAW consumer open: read-only, populated on Linux (the stream is
+   unserialized in full immediately; eager PTE install beats a fault per
+   page). The mizu_read_region cache rides this. NULL on failure. */
+mizu_shm *mizu_shm_open_ro_heap(const char *name);
+
+/* Host-side teardown of a created region: releases the SHM name (POSIX:
+   unlink) / creator handle (Windows) without touching the mapping. */
+void mizu_shm_host_release(mizu_shm *shm);
+/* The survivor-unlink half of a control region's teardown (spill.c):
+   releases the name / creator handle, keeping the mapping (the death
+   watch and parkers reference it until the handle's release). */
+void mizu_region_unlink(mizu_shm *shm);
+
+/* Cold annotation for the error recorders: they sit on every hot verb's
+   failure branches, and as returning variadic functions they otherwise
+   force the compiler to treat those branches as live (register pressure,
+   worse layout, blown inline budgets). */
+#if defined(_MSC_VER)
+#  define MIZU_COLD
+#else
+#  define MIZU_COLD __attribute__((cold))
+#endif
+
+// Errors ---------------------------------------------------------------------------
+
+/* The handle error slot lives in mizu_handle_s; handle-free entry points
+   (regions, prune) use a thread-local slot. Both are printf-formatted
+   records, valid until the next call on the same handle / thread. */
+MIZU_COLD void mizu_err_record(mizu_handle *h, mizu_errcat cat, const char *fmt, ...);
+MIZU_COLD void mizu_err_record_tls(mizu_errcat cat, const char *fmt, ...);
+/* The per-thread shadow of a handle record (err_tls.c): mizu_err_record
+   writes it; the handle error getters read it ahead of the handle slot.
+   Tagged with the handle's address and id (mizu_handle_next_id, err.c). */
+MIZU_COLD void mizu_err_shadow(const void *h, uint64_t id, mizu_errcat cat,
+                               const char *msg);
+const char *mizu_err_shadow_get(const void *h, uint64_t id,
+                                mizu_errcat *cat_out);
+uint64_t mizu_handle_next_id(void);
+/* The const-handle record (the snapshot getters take a const handle):
+   the thread slot plus the shadow for h, so mizu_pool_error / errcat
+   answer the calling thread as for any verb; h NULL records the slot
+   alone. */
+MIZU_COLD void mizu_err_record_const(const mizu_handle *h, mizu_errcat cat,
+                                     const char *fmt, ...);
+/* The region-create failure record shared by the channel/pool creates,
+   the public region create, and the spill layer (err.c): the category
+   describe plus "cannot create <what> (<size> bytes): ..." TLS-side. */
+MIZU_COLD void mizu_err_record_create(mizu_errcat cat, const char *what,
+                                     uint64_t size);
+
+// Spin machinery (parker.c) --------------------------------------------------------
+
+/* Time-boxed pre-park spins: a park/wake round trip costs microseconds,
+   so a wait that would park first spins against a nanosecond budget.
+   Budgets adapt per handle (process-local, never shared): an empty spin
+   halves toward MIZU_SPIN_FLOOR_NS; a completed wait learns its measured
+   turnaround via mizu_spin_learn (1.5x + headroom, capped). */
+#define MIZU_SPIN_BUDGET_NS          16000
+#define MIZU_COLLECT_SPIN_BUDGET_NS  32000
+#define MIZU_SPIN_FLOOR_NS           1000
+#define MIZU_SPIN_CAP_NS             64000
+
+static inline MIZU_MAYBE_UNUSED uint64_t mizu_spin_learn(double gap_ns, uint64_t budget,
+                                      uint64_t base) {
+  if (gap_ns <= (double) MIZU_SPIN_CAP_NS) {
+    uint64_t b = (uint64_t) (1.5 * gap_ns) + 8000;
+    if (b < base) b = base;
+    return b > (uint64_t) MIZU_SPIN_CAP_NS ? (uint64_t) MIZU_SPIN_CAP_NS : b;
+  }
+  budget = budget / 2;
+  return budget < MIZU_SPIN_FLOOR_NS ? MIZU_SPIN_FLOOR_NS : budget;
+}
+
+/* Clock reads per spin stride: default for O(n) scan predicates, LIGHT
+   for 1-2-load predicates (a clock read measurably dominates those). */
+#define MIZU_SPIN_CLOCK_EVERY        8
+#define MIZU_SPIN_CLOCK_EVERY_LIGHT  64
+
+/* Busy-path bound on result-keeper reap visits per worker step. */
+#define MIZU_REAP_QUOTA 32
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#  define MIZU_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+/* isb, not yield: the ARM ARM makes yield a hint and Apple cores retire it
+   as a NOP, so a yield spin free-runs at predicate speed and saturates the
+   load path to the shared line. isb stalls the pipeline ~10-40 cycles — a
+   pause-shaped throttle (Rust's spin_loop and Folly emit it here). */
+#  define MIZU_PAUSE() __asm__ __volatile__("isb sy" ::: "memory")
+#else
+#  define MIZU_PAUSE() do { } while (0)
+#endif
+
+/* Time-boxed pause-hinted spin, the shared pre-announce wait layer:
+   evaluate cond each iteration until it holds (out = 1) or the
+   mizu_now()-scale deadline `until` passes (out = 0), reading the clock
+   every `stride` iterations. A macro: the predicate must inline at each
+   site. Callers clamp `until` to any outer wait deadline themselves. */
+#define MIZU_SPIN_WAIT(cond, until, stride, out)                         \
+  do {                                                                  \
+    (out) = 0;                                                          \
+    for (;;) {                                                          \
+      int mizu_sw_i = 0;                                                 \
+      for (; mizu_sw_i < (stride); mizu_sw_i++) {                         \
+        MIZU_PAUSE();                                                    \
+        if (cond) { (out) = 1; break; }                                 \
+      }                                                                 \
+      if ((out) || mizu_now() >= (until)) break;                         \
+    }                                                                   \
+  } while (0)
+
+// Parker internals -----------------------------------------------------------------
+
+/* The parker struct, the park/unpark verbs, and the mizu_parker_snapshot
+   fast path are binding-author surface (mizu_ext.h); the handshake
+   contract is documented there. What stays here: the platform bounds. */
+
+/* POSIX parks are always timed: an untimed wait is silently restarted
+   under SA_RESTART and would swallow Ctrl-C until the next genuine wake,
+   so "indefinite" (timeout_ms < 0) uses this nominal bound and relies on
+   directed unparks. Windows uses INFINITE there. */
+#define MIZU_PARK_NOMINAL_MS 3600000L
+
+/* Interrupt-latency bound on parks from interactive processes. */
+#ifdef _WIN32
+#  define MIZU_INTERRUPT_BOUND_MS 100L
+#else
+#  define MIZU_INTERRUPT_BOUND_MS 2000L
+#endif
+
+/* timeout_ms (0 polls, < 0 indefinite) to an mizu_now()-scale deadline. */
+static inline MIZU_MAYBE_UNUSED double mizu_deadline(double timeout_ms) {
+  return timeout_ms < 0 ? -1 : mizu_now() + timeout_ms / 1000;
+}
+
+/* Park-timeout budget for a wait deadline: the interrupt-bound ceiling,
+   tightened to the remaining deadline (+1 ms round-up), or -1 once the
+   deadline has passed — the caller disposes (timeout/abort path). A
+   negative deadline takes the ceiling alone, skipping the clock read. */
+static inline MIZU_MAYBE_UNUSED long mizu_wait_ms(double deadline) {
+  if (deadline < 0) return MIZU_INTERRUPT_BOUND_MS;
+  double rem = deadline - mizu_now();
+  if (rem <= 0) return -1;
+  /* clamp ahead of the cast: a huge or non-finite remainder makes
+     (long)(rem * 1000) undefined, and the bound is the answer anyway */
+  if (!(rem < (double) MIZU_INTERRUPT_BOUND_MS / 1000))
+    return MIZU_INTERRUPT_BOUND_MS;
+  return (long) (rem * 1000) + 1;
+}
+
+// Death listener internals ---------------------------------------------------------
+
+/* The mizu_death_watch type, mizu_death_watch_start/stop, and the
+   listener teardown are binding-author surface (mizu_ext.h). start2
+   stays private: the callback-capable form is the pool's worker reap. */
+
+/* The mizu_death_watch_start2 prologue shared by the three platform
+   waiters: the callback/binding fields (their structs all carry these
+   member names). */
+#define MIZU_DW_INIT_COMMON(w, flag, pk, cb, cb_arg)                        \
+  do {                                                                      \
+    (w)->flag = (flag);                                                      \
+    if ((pk) != NULL) {                                                      \
+      (w)->pk = *(pk);                                                       \
+      (w)->has_pk = 1;                                                       \
+    }                                                                        \
+    (w)->cb = (cb);                                                          \
+    (w)->cb_arg = (cb_arg);                                                  \
+  } while (0)
+
+/* As mizu_death_watch_start, plus a callback invoked after the flag store
+   and unpark, on the listener's callback thread (or synchronously from
+   start when the pid is already dead): pure C only; its targets must
+   stay valid until mizu_death_watch_stop returns. The pool's worker reap
+   rides this. This is the threading contract a binding's trace/eval
+   hooks must respect — see the callback-threading note in mizu.h. */
+mizu_death_watch *mizu_death_watch_start2(long pid, _Atomic int *flag,
+                                        const mizu_parker *pk,
+                                        void (*cb)(void *), void *cb_arg);
+
+/* The forked-child release, for the handles' abandon path: no listener
+   interaction (the thread is the parent's), just the child's own fd copy
+   and the struct. */
+void mizu_death_watch_abandon(mizu_death_watch *w);
+
+// Notify endpoints (notify.c; the watches ride wait_*.c) -------------------------
+
+/* The contract is the ext-tier comment block on mizu_channel_notify_arm.
+   The endpoint/tx are heap records owned by one handle; the watch is the
+   listener machinery's persistent registration. Path/address derivation
+   takes the region name (the suffix discipline: both sides derive from
+   the recorded livedir + region, never resolve independently). */
+
+typedef struct mizu_notify_ep_s mizu_notify_ep;
+typedef struct mizu_notify_tx_s mizu_notify_tx;
+typedef struct mizu_notify_watch_s mizu_notify_watch;
+
+/* The consumer endpoint: create + bind. NULL + *err (static message) on
+   failure — on macOS a livedir-derived path past the sun_path budget. */
+mizu_notify_ep *mizu_notify_ep_open(const char *livedir, const char *region,
+                                  const char *tag, const char **err);
+/* The pollable OS handle the watch registers (socket fd / event HANDLE). */
+intptr_t mizu_notify_ep_handle(const mizu_notify_ep *ep);
+/* Drop queued signals (the arm path: a datagram that landed while
+   disarmed costs one empty drain, never a spurious fresh signal). */
+void mizu_notify_ep_drain(mizu_notify_ep *ep);
+/* Close; unlink_path != 0 also removes the macOS socket path. */
+void mizu_notify_ep_close(mizu_notify_ep *ep, int unlink_path);
+/* The survivor's half of that unlink, for a holder that died without a
+   close: removes the endpoint path derived from (livedir, region, tag).
+   A no-op on Windows (kernel object). */
+void mizu_notify_ep_unlink(const char *livedir, const char *region,
+                           const char *tag);
+
+/* The producer's sender to one peer endpoint, opened lazily on the first
+   armed sighting. send is fire-and-forget: a stale or absent endpoint
+   (ENOENT/ECONNREFUSED) and a full receive buffer (EAGAIN — a signal is
+   already queued) are absorbed. NULL on open failure (the sighting that
+   failed retries at the next one). */
+mizu_notify_tx *mizu_notify_tx_open(const char *livedir, const char *region,
+                                  const char *tag);
+void mizu_notify_tx_send(mizu_notify_tx *tx);
+void mizu_notify_tx_close(mizu_notify_tx *tx);
+
+/* The endpoint watch: a persistent registration beside the death watch —
+   every endpoint signal fires cb(ctx) on the listener's thread (the
+   POSIX implementations drain the socket first). cb is pure C, may run
+   on any thread, and its targets must stay valid until
+   mizu_notify_watch_stop returns: stop synchronizes with an in-flight
+   callback. NULL on failure. */
+mizu_notify_watch *mizu_notify_watch_start(intptr_t ep_handle,
+                                         void (*cb)(void *), void *ctx);
+void mizu_notify_watch_stop(mizu_notify_watch *w);
+/* The forked-child release (the abandon path): the child's own fd copy
+   and the struct; no listener interaction. */
+void mizu_notify_watch_abandon(mizu_notify_watch *w);
+
+// Liveness lock internals (liveness.c) ------------------------------------------
+
+/* Liveness path sizing: a lock path is "<livedir>/mizu_<name>...", and
+   create/attach reject a livedir past MIZU_LIVEDIR_MAX so the full path
+   always fits a MIZU_PATH_BUF buffer. */
+#define MIZU_LIVEDIR_MAX 900
+#define MIZU_PATH_BUF    1024
+
+/* The liveness contract, mizu_live_dir/open/try/close, and the
+   mizu_live_probe enum are binding-author surface (mizu_ext.h). What
+   stays here: the prober's kept-fd forms. */
+
+/* Open without creating: ENOENT reads as "indeterminate, treat as
+   alive", never a verdict — the probe-by-path discipline. */
+int mizu_live_open_existing(const char *path, intptr_t *out);
+/* Release an acquired lock while keeping the fd — the kept-fd prober's
+   epilogue after a reap, so a respawned holder can lock the same file. */
+void mizu_live_unlock(intptr_t h);
+/* The locked file's identity — (dev, inode) / (volume serial, file
+   index) — recorded in registry slots at join so a path-opened prober
+   can discard a probe whose file was unlinked and recreated. */
+int mizu_live_ident(intptr_t h, uint64_t *dev, uint64_t *ino);
+
+// Preamble internals (preamble.c) --------------------------------------------------
+
+/* mizu_preamble_write/validate are binding-author surface (mizu_ext.h).
+   What stays here: the attach-path checks. */
+
+/* The join-token charset check shared by the channel and pool attach
+   paths ("<pid hex>_<counter hex>"; NULL and empty are malformed). */
+int mizu_token_valid(const char *token);
+/* The exact region-name grammar for a wire-carried name (the prefix
+   plus "<hex>_<hex>", nothing else): the gate for the read-side opens
+   against a "/../" traversal from a corrupt or hostile peer. */
+int mizu_name_valid(const char *name);
+/* token -> "<prefix><token>" region name, and the inverse (the join
+   token is the name past the prefix). Both record TLS-side on failure
+   ("malformed region-name suffix" / "token buffer too small"): the
+   channel/pool attach and token-getter prologues (preamble.c). */
+int mizu_name_from_token(const char *token, char *name, size_t cap);
+mizu_status mizu_token_from_name(const char *name, char *buf, size_t cap);
+/* The pool header's magic + version + layout check (pool.c), the attach
+   path's counterpart of mizu_preamble_validate. */
+const char *mizu_pool_hdr_validate(const void *region, size_t region_size,
+                                  mizu_pool_hdr *out);
+
+// Payload-policy helpers ------------------------------------------------------------
+
+/* Whether a staged payload created no keeper record, so the collect-side
+   keeper-drop wake is pure cost: the immediate kinds, or an INLINE frame
+   whose stager claimed keeperless on the wire (MIZU_AUX_F_KEEPERLESS).
+   The core reads the claim, never verifies it; clear is always correct
+   (at worst a spurious keeper-drop wake), and a wrongly-set bit defers
+   reclaim, never frees early — the keeper drop itself is recorded
+   unconditionally at collect. Core-only: the core owns the wake gate. */
+static inline MIZU_MAYBE_UNUSED int mizu_keeperless(uint32_t kind,
+                                 uint64_t aux) {
+  return kind == MIZU_KIND_NIL || kind == MIZU_KIND_RAWVEC ||
+    kind == MIZU_KIND_STR1 ||
+    (kind == MIZU_KIND_INLINE && (aux & MIZU_AUX_F_KEEPERLESS) != 0);
+}
+
+// Spill free list, lent-region ledger, open cache, retain table (spill.c) ---------
+
+#define MIZU_SPILL_FL_MAX    32
+#define MIZU_SPILL_FL_CLASS  16
+#define MIZU_SPILL_FL_BYTES  ((size_t) 64 << 20)
+#define MIZU_SPILL_FL_FLOOR  ((size_t) 4096)
+#define MIZU_LEDGER_MAX      256
+/* Outstanding lent-region bytes at which the zc churn fallback engages:
+   below it a free-list miss creates fresh (a ~1 ms huge-folio create
+   beats the copy tiers' extra passes); past it the copy tiers'
+   deterministic reuse caps tmpfs growth. 256 MB = 4x the free-list
+   byte cap. */
+#define MIZU_ZC_LENT_BUDGET  ((size_t) 256 << 20)
+
+/* Producer spill-region free list + lent-region ledger. Regions are
+   mizu_shm pointers owned by the handle outright: created or popped at
+   stage, surrendered at the consumer-done release points, closed +
+   unlinked at eviction and teardown. Reuse is safe only because a region
+   is offered exclusively at the protocol's consumer-done release points. */
+typedef struct mizu_spill_fl_s {
+  mizu_shm *regions[MIZU_SPILL_FL_MAX]; /* owned; evict/teardown = close+unlink */
+  size_t   size[MIZU_SPILL_FL_MAX];    /* region size; 0 = empty entry */
+  uint64_t stamp[MIZU_SPILL_FL_MAX];   /* push order: largest-oldest evict */
+  uint64_t tick;
+  size_t   total;
+  uint32_t n;
+  int      last_reused;               /* whether the last pop hit */
+  uint64_t hits;                      /* process-local, dump-only */
+  mizu_shm *led_regions[MIZU_LEDGER_MAX];  /* lent: views outstanding */
+  int32_t  led_key[MIZU_LEDGER_MAX];      /* consumer identity; -1 channel */
+  int64_t  led_pid[MIZU_LEDGER_MAX];      /* the consumer occupant's pid; 0 unknown */
+  uint32_t led_n;
+  uint32_t sweep_next;                  /* quota-sweep rotation start */
+  size_t   lent_bytes;    /* sizes of lent (ledger) + overflow-dropped
+                             regions: the churn fallback's budget gauge */
+  /* ledger-overflow drops: the mapping closes at the drop; the name is
+     kept so a REF in flight can still resolve, and unlinks at teardown */
+  mizu_shm **dropped;
+  uint32_t dropped_n;
+  uint32_t dropped_cap;
+  /* the one uncommitted staging checkout: set by mizu_stage_spill_get,
+     committed to a retain-table slot (or discarded) at publish, rolled
+     back to the free list at the next staging verb or handle teardown —
+     a mid-stage abandon never leaks a region. pin/kind ride along: a
+     registered pin is dropped through the binding's drop hook on every
+     abandonment path. */
+  mizu_shm *staging;
+  void    *staging_pin;
+  uint8_t  staging_kind;              /* MIZU_KEEP_SPILL / _ZC / _PIN */
+  /* set when a spill pop misses with lent bytes past MIZU_ZC_LENT_BUDGET
+     (the sweep just proved consumer-side views outlive their traffic,
+     past the volume a fresh create per payload tolerates): the signal
+     for the binding's copy-tier fallback; cleared when a ledger sweep
+     or force-reclaim brings lent bytes back under the budget. Raised
+     on Linux only (fresh regions pre-fault there; macOS/Windows
+     creates are lazy, so SHM_VEC stays cheaper than the copy tiers
+     even under churn). */
+  int churn;
+} mizu_spill_fl;
+
+/* Per-slot retain table entry — the explicit successor of a GC keeper.
+   Staging always copies, so the only retained objects are the regions a
+   staged payload references plus the binding's opaque pin (the staged
+   object, whose serialized stream may carry hook-emitted identifiers).
+   kind: SPILL — the region surrenders to the free list at release; ZC —
+   the producer-loan refcount sub, then free list or lent ledger by key;
+   PIN — no region, the pin alone. The pin is dropped through the
+   binding's drop hook at every release point. */
+enum { MIZU_KEEP_FREE = 0, MIZU_KEEP_SPILL, MIZU_KEEP_ZC, MIZU_KEEP_PIN };
+
+typedef struct mizu_keeper_s {
+  mizu_shm *region;  /* SPILL/ZC: the staged region, owned until release */
+  void    *pin;     /* opaque binding token, dropped via binding.drop */
+  int32_t  key;     /* ZC: the consumer's identity for the lent ledger */
+  int64_t  pid;     /* ZC: the pid occupying that identity at the release */
+  uint8_t  kind;
+} mizu_keeper;
+
+/* The retain-table primitives. h supplies the free list and the
+   binding's drop hook; tab is one of the handle's tables (the pool has
+   two). commit moves the current staging checkout into the (FREE) slot;
+   release surrenders the slot's entry per its kind at a consumer-done
+   point; discard abandons a never-published staged entry (a cancelled
+   publish); rollback returns an uncommitted checkout to the free list;
+   teardown closes + unlinks everything at handle death. */
+void mizu_keeper_commit(mizu_handle *h, mizu_keeper *tab, uint32_t at);
+void mizu_keeper_release(mizu_handle *h, mizu_keeper *tab, uint32_t at);
+void mizu_keeper_discard(mizu_handle *h);
+/* mizu_stage_rollback is the ext tier's (mizu_ext.h) */
+void mizu_keepers_teardown(mizu_handle *h, mizu_keeper *tab, uint32_t n);
+void mizu_spill_fl_teardown(mizu_handle *h, mizu_spill_fl *fl);
+
+/* Pop the smallest fitting free-list region (a full ledger sweep first on
+   a miss) or create one fresh — at the pow2 size class when a free list
+   is in play, exact otherwise. The checkout is recorded in fl->staging
+   until committed or rolled back. NULL + the thread-local error slot on
+   create failure. */
+mizu_shm *mizu_spill_region_get(mizu_spill_fl *fl, size_t n);
+/* Insert a producer region into the free list under the size-class and
+   byte caps (evicting largest-oldest), or close + unlink it in place
+   when it doesn't fit. */
+void mizu_spill_fl_insert(mizu_spill_fl *fl, mizu_shm *shm);
+/* The producer-loan release for a ZC retain entry: refcount sub, then
+   free list on 0 or the lent-region ledger otherwise. */
+void mizu_zc_release(mizu_spill_fl *fl, mizu_shm *shm, int32_t key,
+                     int64_t pid);
+/* Move zero-count ledger entries to the free list, up to quota
+   (MIZU_LEDGER_MAX = full sweep). */
+void mizu_ledger_sweep(mizu_spill_fl *fl, uint32_t quota);
+/* Lent-region ledger keys carry the consumer's kind in the high half:
+   a worker handle's ledger holds both result regions (consumed by a
+   submitter slot) and task-arg regions (consumed by a worker slot), and
+   a death force-reclaim must match exactly one namespace. */
+#define MIZU_LED_SUB 1          /* the consumer is a submitter slot */
+#define MIZU_LED_WK  2          /* the consumer is a worker slot */
+#define MIZU_LED_KEY(kind, slot) \
+  ((int32_t) (((kind) << 16) | ((slot) & 0xffff)))
+/* Force-reclaim ledger entries after a confirmed consumer death:
+   (kind, slot) encodes the one consumer to match, kind < 0 all entries
+   (the channel's single peer); pid narrows the match to the entries
+   recorded under that occupant of the slot (0 matches any), so a verdict
+   on one occupant never reclaims what a later occupant of the same slot,
+   or a cleanly departed earlier one, still views. REFHELD entries leak +
+   unlink; the rest rejoin the free list. */
+void mizu_ledger_force(mizu_spill_fl *fl, int32_t kind, int32_t slot,
+                       int64_t pid);
+
+/* Consumer-side SHM_RAW mapping cache: a name -> mapping table that
+   skips the open/fstat/mmap per payload once producers repeat region
+   names. Mappings are handle-owned — eviction and teardown close them in
+   place; the SHM_RAW tiers copy out before consumer-done, so no view
+   outlives a mapping here (view caches are binding-owned for that
+   reason). Names never alias and a region's size is fixed for its
+   lifetime, so entries cannot go stale. Counters are process-local,
+   dump-only. */
+typedef struct mizu_open_cache_s {
+  mizu_shm *maps[MIZU_OPEN_CACHE_MAX];  /* owned; evict = close */
+  char names[MIZU_OPEN_CACHE_MAX][MIZU_NAME_MAX];
+  uint8_t name_len[MIZU_OPEN_CACHE_MAX];   /* 0 = empty entry */
+  uint64_t stamp[MIZU_OPEN_CACHE_MAX];
+  uint64_t tick;
+  uint64_t hits, misses;
+} mizu_open_cache;
+
+mizu_shm *mizu_oc_lookup(mizu_open_cache *oc, const unsigned char *name,
+                       uint32_t len);
+void mizu_oc_store(mizu_open_cache *oc, mizu_shm *shm);
+void mizu_oc_teardown(mizu_open_cache *oc);
+
+// Handle base (channel.c / pool.c embed as first member) --------------------------
+
+/* Every handle embeds this header as its first member, so an
+   mizu_channel or mizu_pool pointer converts to mizu_handle for the
+   callback seam. The full struct definitions live with their TUs.
+   htype (MIZU_HTYPE_*, mizu_ext.h) dispatches the handle-kind-specific
+   staging services (mizu_stage_arena_alloc / mizu_stage_reap are
+   channel-only). */
+struct mizu_handle_s {
+  mizu_binding binding;          /* copied in at create/attach: one load +
+                                   a predicted indirect branch per call */
+  mizu_errcat errcat;            /* verb error slot — valid until the next */
+  char errmsg[256];             /*   call on this handle */
+  uint64_t id;                  /* process-unique (mizu_handle_next_id):
+                                   the error shadow's tag, so a handle
+                                   reallocated at a dead one's address
+                                   never inherits a thread's stale record */
+  uint8_t htype;                /* MIZU_HTYPE_*; 0 = unset */
+  mizu_spill_fl fl;              /* producer free list + lent-region ledger */
+  mizu_open_cache oc;            /* consumer SHM_RAW mapping cache */
+  mizu_read_ctx read_tmpl;       /* per-read ctx template: size/handle/
+                                   binding_ctx set once at create/attach;
+                                   each read copies it and fills only the
+                                   outcome fields. Handles are
+                                   single-threaded per side, so a
+                                   handle-owned mutable ctx is safe. */
+};
+
+/* Initialize the handle's read-ctx template once the binding is in
+   (create/attach/join). */
+static inline MIZU_MAYBE_UNUSED void mizu_read_tmpl_init(mizu_handle *h) {
+  h->id = mizu_handle_next_id();
+  memset(&h->read_tmpl, 0, sizeof(h->read_tmpl));
+  h->read_tmpl.size = (uint32_t) sizeof(h->read_tmpl);
+  h->read_tmpl.died_slot = -1;
+  h->read_tmpl.handle = h;
+  h->read_tmpl.binding_ctx = h->binding.ctx;
+}
+
+/* The closed + fork guard shared by the channel/pool raising-verb
+   getters: NULL records TLS-side (no handle to record on), a live
+   handle records on itself. released/self_pid ride as parameters —
+   they live past this shared header, in each TU's own struct. */
+static inline MIZU_MAYBE_UNUSED int mizu_handle_check(mizu_handle *h,
+                                                   int released,
+                                                   long self_pid,
+                                                   const char *what) {
+  if (h == NULL) {
+    mizu_err_record_tls(MIZU_ERRCAT_OTHER, "%s handle is closed", what);
+    return -1;
+  }
+  if (released) {
+    mizu_err_record(h, MIZU_ERRCAT_OTHER, "%s handle is closed", what);
+    return -1;
+  }
+  if (self_pid != mizu_self_pid()) {
+    mizu_err_record(h, MIZU_ERRCAT_OTHER, "%s handles do not survive fork()",
+                   what);
+    return -1;
+  }
+  return 0;
+}
+
+static inline MIZU_MAYBE_UNUSED mizu_status mizu_handle_intr(mizu_handle *h) {
+  mizu_err_record(h, MIZU_ERRCAT_INTERRUPTED, "interrupted");
+  return MIZU_ERR;
+}
+
+static inline MIZU_MAYBE_UNUSED mizu_status mizu_handle_forked(mizu_handle *h,
+                                                              const char *what) {
+  mizu_err_record(h, MIZU_ERRCAT_OTHER, "%s handles do not survive fork()",
+                 what);
+  return MIZU_ERR;
+}
+
+static inline MIZU_MAYBE_UNUSED int mizu_check_interrupt(const mizu_binding *b) {
+  return b->check != NULL ? b->check(b->ctx) : 0;
+}
+
+static inline MIZU_MAYBE_UNUSED void mizu_park_bracket(const mizu_binding *b, int entering) {
+  if (b->park != NULL) b->park(b->ctx, entering);
+}
+
+/* The create/attach/join binding gate: stage/read callbacks and a
+   language-tagged identity word are mandatory. `what` names the handle
+   kind for the error record ("channel" / "pool"). */
+/* The result-slot state word (mizu.h's mizu_rs_hdr): state, claimant and
+   incarnation in one CAS-able word. wk is the worker slot, -1 for none. */
+static inline MIZU_MAYBE_UNUSED int32_t mizu_rs_st(uint64_t w) {
+  return (int32_t) (w & MIZU_RS_STATE_MASK);
+}
+static inline MIZU_MAYBE_UNUSED int32_t mizu_rs_wk(uint64_t w) {
+  return (int32_t) ((w >> MIZU_RS_WK_SHIFT) & MIZU_RS_WK_MASK) - 1;
+}
+static inline MIZU_MAYBE_UNUSED uint64_t mizu_rs_seq(uint64_t w) {
+  return w >> MIZU_RS_SEQ_SHIFT;
+}
+static inline MIZU_MAYBE_UNUSED uint64_t mizu_rs_pack(uint64_t seq, int32_t wk,
+                                                      int32_t st) {
+  return (seq << MIZU_RS_SEQ_SHIFT) |
+    (((uint64_t) (uint32_t) (wk + 1) & MIZU_RS_WK_MASK) << MIZU_RS_WK_SHIFT) |
+    ((uint64_t) (uint32_t) st & MIZU_RS_STATE_MASK);
+}
+/* The same incarnation and claimant in a new state. */
+static inline MIZU_MAYBE_UNUSED uint64_t mizu_rs_with(uint64_t w, int32_t st) {
+  return (w & ~MIZU_RS_STATE_MASK) | ((uint64_t) (uint32_t) st & MIZU_RS_STATE_MASK);
+}
+/* Outstanding: not yet terminal. */
+static inline MIZU_MAYBE_UNUSED int mizu_rs_live(int32_t st) {
+  return st == MIZU_RS_PENDING || st == MIZU_RS_RUNNING;
+}
+/* A published verdict a collector consumes (CANCEL is the worker's). */
+static inline MIZU_MAYBE_UNUSED int mizu_rs_collectible(int32_t st) {
+  return st == MIZU_RS_OK || st == MIZU_RS_ERR || st == MIZU_RS_DIED ||
+    st == MIZU_RS_LOST;
+}
+
+static inline MIZU_MAYBE_UNUSED int mizu_binding_check(const mizu_binding *b,
+                                                      const char *what) {
+  if (b == NULL || b->stage == NULL || b->read == NULL) {
+    mizu_err_record_tls(MIZU_ERRCAT_OTHER,
+                       "a %s binding needs stage and read callbacks", what);
+    return -1;
+  }
+  if (b->size != sizeof(*b)) {
+    mizu_err_record_tls(MIZU_ERRCAT_OTHER,
+                       "a %s binding must be initialized with "
+                       "mizu_binding_init (size stamp mismatch)", what);
+    return -1;
+  }
+  if ((uint8_t) b->ident == MIZU_LANG_NONE) {
+    mizu_err_record_tls(MIZU_ERRCAT_OTHER,
+                       "a %s binding needs an identity word with a nonzero "
+                       "language byte", what);
+    return -1;
+  }
+  if ((b->flags & ~MIZU_BINDING_FLAGS_ALL) != 0) {
+    mizu_err_record_tls(MIZU_ERRCAT_OTHER,
+                       "a %s binding sets unknown binding flags", what);
+    return -1;
+  }
+  return 0;
+}
+
+// Arrow frame writer internals (arrow.c) ------------------------------------------
+
+/* The raw layout write into caller memory (base sized mizu_arrow_size) and
+   the frame's total row count: the unit tier's byte-compare surface.
+   Bindings stage through mizu_arrow_stage; only tests/unit/test_arrow.c
+   calls these. The write runs the memoized size pass first when
+   mizu_arrow_size didn't. */
+void mizu_arrow_write(mizu_arrow *, void *base, mizu_arrow_warn *);
+int64_t mizu_arrow_rows(const mizu_arrow *);
+
+#endif /* MIZU_INTERNAL_H */

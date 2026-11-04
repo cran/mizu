@@ -1,0 +1,70 @@
+/* Bounded single-pass serialize stream — the second mizu-owned delta over the
+   vendored core. The vendored streams are strict count-then-write; the ring's
+   INLINE fast path serializes directly into the slot's inline region and
+   flips to count-only mode on overflow: one pass total for payloads that fit
+   (the dominant case in the target regime), and an exact total size for the
+   spill allocation when they don't, at the cost of at most one inline budget
+   of discarded copy. Same R_outpstream discipline as mizu_view_serialize_into;
+   the vendored two-pass invariant is untouched on the spill path. */
+
+#include "mizu.h"
+
+typedef struct mizu_bounded_s {
+  unsigned char *buf;        /* NULL once overflowed: count-only mode */
+  size_t limit;
+  size_t total;
+} mizu_bounded;
+
+static void mizu_write_bounded(R_outpstream_t stream, void *src, int len) {
+  mizu_bounded *b = (mizu_bounded *) stream->data;
+  size_t n = (size_t) len;
+  if (b->buf != NULL) {
+    if (b->total + n <= b->limit)
+      memcpy(b->buf + b->total, src, n);
+    else
+      b->buf = NULL;
+  }
+  b->total += n;
+}
+
+size_t mizu_serialize_bounded(unsigned char *dst, size_t limit, SEXP object) {
+
+  mizu_bounded b = {.buf = dst, .limit = limit, .total = 0};
+  struct R_outpstream_st out;
+
+  R_InitOutPStream(&out, (R_pstream_data_t) &b, R_pstream_binary_format,
+                   3, NULL, mizu_write_bounded, NULL, R_NilValue);
+  R_Serialize(object, &out);
+
+  return b.total;
+}
+
+// .Call test surface -----------------------------------------------------------
+
+/* Serialize object against a byte limit; returns list(size, bytes) where
+   bytes is the complete stream if it fit within limit, else NULL. */
+SEXP mizu_bounded_call(SEXP object, SEXP limit) {
+  double lim_in = Rf_asReal(limit);
+  if (!(lim_in >= 0)) Rf_error("mizu: invalid limit");
+  /* clamp ahead of the double→size_t cast: undefined past SIZE_MAX, and
+     the R_alloc below fails the clamped size cleanly */
+  size_t lim = lim_in >= MIZU_DBL_U64 ? SIZE_MAX : (size_t) lim_in;
+
+  unsigned char *buf = (unsigned char *) R_alloc(lim > 0 ? lim : 1, 1);
+  size_t n = mizu_serialize_bounded(buf, lim, object);
+
+  SEXP out = PROTECT(Rf_allocVector(VECSXP, 2));
+  SET_VECTOR_ELT(out, 0, Rf_ScalarReal((double) n));
+  if (n <= lim) {
+    SEXP bytes = Rf_allocVector(RAWSXP, (R_xlen_t) n);
+    SET_VECTOR_ELT(out, 1, bytes);
+    memcpy(RAW(bytes), buf, n);
+  }
+  UNPROTECT(1);
+  return out;
+}
+
+SEXP mizu_unserialize_call(SEXP bytes) {
+  if (TYPEOF(bytes) != RAWSXP) Rf_error("mizu: expected a raw vector");
+  return mizu_view_unserialize_from(RAW(bytes), (size_t) XLENGTH(bytes));
+}

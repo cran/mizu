@@ -1,0 +1,512 @@
+# Forward-slashed tempfile safe to embed in child code via deparse()
+tfile <- function() gsub("\\\\", "/", tempfile())
+
+wait_for_file <- function(path, timeout = 10) {
+  t0 <- Sys.time()
+  while (!file.exists(path)) {
+    if (difftime(Sys.time(), t0, units = "secs") > timeout) {
+      return(FALSE)
+    }
+    Sys.sleep(0.05)
+  }
+  TRUE
+}
+
+# Hard-kill a process: no handlers, no finalizers. tools::SIGKILL is NA on
+# Windows (the signal is undefined there), and pskill ignores the signal
+# value anyway — any non-NA signal is TerminateProcess — so SIGTERM gives
+# SIGKILL semantics on Windows.
+kill_hard <- function(pid) {
+  tools::pskill(
+    pid,
+    if (is.na(tools::SIGKILL)) {
+      tools::SIGTERM
+    } else {
+      tools::SIGKILL
+    }
+  )
+}
+
+# Liveness probe for a raw pid. pskill(pid, 0) is the POSIX probe, but on
+# Windows pskill ignores the signal value, so probing with 0 would
+# terminate the process — ask tasklist instead. A zombie answers the POSIX
+# probe but is dead: its PID stays taken until its parent or the system
+# init reaps it, so the zombie state is checked explicitly.
+pid_alive <- function(pid) {
+  pid <- as.integer(pid)
+  if (.Platform[["OS.type"]] == "windows") {
+    out <- suppressWarnings(system2(
+      "tasklist",
+      c("/FI", sprintf('"PID eq %d"', pid), "/NH", "/FO", "CSV"),
+      stdout = TRUE,
+      stderr = FALSE
+    ))
+    return(any(grepl(sprintf('","%d","', pid), out, fixed = TRUE)))
+  }
+  if (!isTRUE(tools::pskill(pid, 0L))) {
+    return(FALSE)
+  }
+  if (pid_zombie(pid)) {
+    # Linux reports the thread-group leader's zombie state: the leader can
+    # be a zombie while siblings still exit, and the process's flocks die
+    # only with the last thread's fd-table teardown — still alive until
+    # the whole group is gone
+    return(pid_group_lingers(pid))
+  }
+  TRUE
+}
+
+# Linux: any threads of `pid`'s group still exiting past the zombie leader
+# (/proc/<pid>/task lists each not-fully-exited thread next to the leader)
+pid_group_lingers <- function(pid) {
+  task <- sprintf("/proc/%d/task", pid)
+  dir.exists(task) && length(list.files(task)) > 1L
+}
+
+pid_zombie <- function(pid) {
+  status <- sprintf("/proc/%d/status", pid)
+  if (file.exists(status)) {
+    # the process can be reaped between the exists probe and the read: a
+    # failed read (a warning, then an error) means gone entirely, not zombie
+    state <- tryCatch(
+      suppressWarnings(readLines(status)),
+      error = function(e) character()
+    )
+    return(any(grepl("^State:\\s+Z", state)))
+  }
+  stat <- suppressWarnings(system2(
+    "ps",
+    c("-o", "stat=", "-p", pid),
+    stdout = TRUE,
+    stderr = FALSE
+  ))
+  any(startsWith(trimws(stat), "Z"))
+}
+
+# Re-evaluate `expr` in the caller's frame until truthy or the deadline passes
+wait_until <- function(expr, timeout = 10) {
+  q <- substitute(expr)
+  env <- parent.frame()
+  t0 <- Sys.time()
+  repeat {
+    if (isTRUE(eval(q, env))) {
+      return(TRUE)
+    }
+    if (difftime(Sys.time(), t0, units = "secs") > timeout) {
+      return(FALSE)
+    }
+    Sys.sleep(0.05)
+  }
+}
+
+# A corruption-loop closure over a mapped region: corrupt(off, bytes, msg)
+# pokes bytes at off, expects expr (captured at creation) to error matching
+# msg, then restores hdr (peeked from offset 0 before any corruption)
+make_corrupt <- function(rw, hdr, expr) {
+  q <- substitute(expr)
+  env <- parent.frame()
+  force(rw)
+  force(hdr)
+  function(off, bytes, msg) {
+    .Call(mizu:::mizu_poke, rw, off, as.raw(bytes))
+    expect_error(eval(q, env), msg)
+    .Call(mizu:::mizu_poke, rw, 0, hdr)
+    invisible(NULL)
+  }
+}
+
+# The corruption-read idiom: a doctored payload rejects at read, and the
+# raise is contained — the next send receives cleanly (no wedge)
+expect_corrupt_recv <- function(p, msg = "corrupt payload slot") {
+  expect_error(mizu_recv(p[["peer"]], 5), msg)
+  mizu_send(p[["host"]], "tail")
+  expect_identical(mizu_recv(p[["peer"]], 5), "tail")
+  invisible(NULL)
+}
+
+# Poke each (off, bytes) pair of a mapped region, evaluate `expr`, then
+# restore the original bytes (even on failure)
+with_corruption <- function(rw, pokes, expr) {
+  olds <- lapply(
+    pokes,
+    function(pk) .Call(mizu:::mizu_peek, rw, pk[[1L]], length(pk[[2L]]))
+  )
+  for (pk in pokes) {
+    .Call(mizu:::mizu_poke, rw, pk[[1L]], as.raw(pk[[2L]]))
+  }
+  on.exit(
+    for (i in seq_along(pokes)) {
+      .Call(mizu:::mizu_poke, rw, pokes[[i]][[1L]], olds[[i]])
+    },
+    add = TRUE
+  )
+  eval(substitute(expr), parent.frame())
+}
+
+# Remove a pool's liveness lock files: an owner killed before any
+# participant joined has no teardown (the failed-join probe refuses, the
+# reaper skips non-region names), so the test cleans up itself
+pool_live_remove <- function(suffix) {
+  dir <- .Call(mizu:::mizu_live_dir_call)
+  file.remove(list.files(
+    dir,
+    sprintf("^mizu_%s[.]", suffix),
+    full.names = TRUE
+  ))
+}
+
+# Cross-process tests spawn fresh Rscript children that library(mizu):
+# available under R CMD check (mizu is installed in the check library and
+# mizu_spawn propagates its path via argv), but not under a bare load_all().
+child_mizu_ok <- local({
+  val <- NULL
+  function() {
+    if (is.null(val)) {
+      f <- tfile()
+      mizu:::mizu_spawn(sprintf(
+        'if (requireNamespace("mizu", quietly = TRUE)) file.create(%s)',
+        deparse(f)
+      ))
+      val <<- wait_for_file(f, 30)
+      unlink(f)
+    }
+    val
+  }
+})
+
+skip_if_no_child_mizu <- function() {
+  testthat::skip_on_cran()
+  testthat::skip_if_not(
+    child_mizu_ok(),
+    "mizu not loadable from child processes"
+  )
+}
+
+# The orphan-reaping tests need an init that reaps: R detaches background
+# spawns, so a dead child's PID stays taken by a zombie until PID 1 reaps
+# it — and the vendored reaper reclaims a region only once the creator's
+# PID is free.
+reaper_ok <- local({
+  val <- NULL
+  function() {
+    if (is.null(val)) {
+      f <- tfile()
+      mizu:::mizu_spawn(sprintf(
+        '
+        tmp <- paste0(%s, ".tmp")
+        writeLines(as.character(Sys.getpid()), tmp)
+        file.rename(tmp, %s)
+      ',
+        deparse(f),
+        deparse(f)
+      ))
+      # the probe child exits at once; its PID frees only if PID 1 reaps
+      val <<- wait_for_file(f) &&
+        wait_until(!isTRUE(tools::pskill(as.integer(readLines(f)), 0L)), 10)
+      unlink(f)
+    }
+    val
+  }
+})
+
+skip_if_no_reaper <- function() {
+  testthat::skip_on_cran()
+  testthat::skip_if_not(reaper_ok(), "PID 1 does not reap orphans")
+}
+
+# Fork is unavailable on Windows and blocked in Positron/RStudio sessions
+# (their mcfork hook raises). Probe once with a trivial collected child.
+fork_ok <- function() {
+  ok <- tryCatch(
+    parallel::mccollect(parallel::mcparallel(TRUE, silent = TRUE)),
+    error = function(e) NULL
+  )
+  isTRUE(ok[[1L]])
+}
+
+# A forked child inherits the parent's live-thread TLS blocks (cli's ticker
+# thread, the death-listener thread), which valgrind reports as possibly
+# lost: in-process forks are unsound under instrumentation. The maps probe
+# (not VALGRIND_OPTS, which container images set globally) tells whether
+# this process itself is traced.
+on_valgrind <- function() {
+  file.exists("/proc/self/maps") &&
+    any(grepl(
+      "vgpreload",
+      readLines("/proc/self/maps", warn = FALSE),
+      fixed = TRUE
+    ))
+}
+
+skip_if_no_fork <- function() {
+  testthat::skip_on_cran()
+  testthat::skip_if(
+    on_valgrind(),
+    "forked children report inherited thread TLS as lost under valgrind"
+  )
+  testthat::skip_if_not(fork_ok(), "fork is unavailable in this session")
+}
+
+# The nesting depth at which R_Serialize's recursion hits the C-stack limit
+# is platform-specific (frame sizes, R's stack limit): probe it and hand
+# back a depth safely past the first raising one. 0 = no raise up to the
+# probe cap (a very large C stack) — the caller skips.
+cstack_trigger_depth <- local({
+  val <- NULL
+  function() {
+    if (is.null(val)) {
+      deep <- function(n) {
+        x <- NULL
+        for (i in seq_len(n)) {
+          x <- list(x)
+        }
+        x
+      }
+      val <<- 0L
+      for (d in c(25000L, 50000L, 100000L, 200000L)) {
+        raised <- tryCatch(
+          {
+            serialize(deep(d), NULL)
+            FALSE
+          },
+          error = function(e) {
+            grepl("C stack", conditionMessage(e), fixed = TRUE)
+          }
+        )
+        if (raised) {
+          val <<- 2L * d
+          break
+        }
+      }
+    }
+    val
+  }
+})
+
+# A read failure the C read guard catches (src/stage_r.c) is first raised
+# under R_ToplevelExec, and R prints the error to stderr at that toplevel
+# jump before expect_error() catches the re-raised condition. Hush the
+# printer for the calling test so intentional-corruption tests stay quiet.
+hush_error_print <- function() {
+  old <- options(show.error.messages = FALSE)
+  do.call(
+    "on.exit",
+    list(substitute(options(x), list(x = old)), add = TRUE),
+    envir = parent.frame()
+  )
+  invisible(old)
+}
+
+# In-process channel pair: both ends of one region attached from this
+# process — the deterministic harness for ring mechanics, with no process
+# management involved. The host end produces on the same ring the peer end
+# consumes, exactly as across processes.
+channel_pair <- function(
+  capacity = 64L,
+  slot_size = 256L,
+  arena_size = 4096,
+  spin = FALSE,
+  ident = NULL
+) {
+  host <- .Call(
+    mizu:::mizu_channel_create,
+    quote(NULL),
+    capacity,
+    slot_size,
+    arena_size,
+    spin
+  )
+  att <- .Call(
+    mizu:::mizu_channel_attach,
+    .Call(mizu:::mizu_channel_suffix, host),
+    ident
+  )
+  peer <- att[[1L]]
+  .Call(mizu:::mizu_channel_ready_set, peer)
+  if (!.Call(mizu:::mizu_channel_ready_wait, host, 10)) {
+    stop("channel peer not ready")
+  }
+  list(host = host, peer = peer)
+}
+
+# A foreign channel: the host's peer reports Python with the given
+# capability mask, so the host end stages interop and the (R) peer end
+# reads it back.
+foreign_pair <- function(caps = 0L, ...) {
+  channel_pair(ident = c(3L, as.integer(caps)), ...)
+}
+
+# c(refcount, flags) of the region behind a view; integer(0) otherwise.
+rc_of <- function(x) .Call(mizu:::mizu_zc_refcount, x)
+
+# Snapshot transform for print-output tests: scrub volatile region names —
+# "/mizu_<pid>_<counter>" on POSIX, "Local\mizu_<pid>_<counter>" on Windows —
+# so snapshots stay byte-stable across runs and platforms.
+scrub_mizu_names <- function(x) {
+  gsub("(Local\\\\|/)?mizu_[0-9a-f]+_[0-9a-f]+", "mizu_…", x)
+}
+
+# The canonical peer expression: echo everything until close or host death.
+# An idle timeout is not terminal — under instrumentation (valgrind) the
+# producer can exceed any idle bound — so only other sentinels end the loop.
+echo_expr <- quote(
+  repeat {
+    x <- mizu_recv(ch, timeout = 30)
+    if (inherits(x, "mizu_timeout")) {
+      next
+    }
+    if (inherits(x, "mizu_sentinel")) {
+      break
+    }
+    mizu_send(ch, x)
+  }
+)
+
+# Orderly in-process channel teardown: the peer signals its close (flush +
+# bit + wake), so both ends' close rendezvous succeeds.
+channel_end <- function(p) {
+  .Call(mizu:::mizu_channel_close_signal, p[["peer"]])
+  .Call(mizu:::mizu_channel_close, p[["host"]], 5)
+  .Call(mizu:::mizu_channel_close, p[["peer"]], 5)
+}
+
+# In-process pool pair: controller plus one or more worker handles joined
+# from this process — the deterministic harness for the injection /
+# result-slot / stealing protocols, with no process management involved.
+# Workers consume via single steps driven by the test; p$wk is the first
+# worker, p$wks all of them.
+pool_pair <- function(
+  workers = 1L,
+  max_submitters = 8L,
+  injection_cap = 64L,
+  per_worker_cap = 64L,
+  result_slots = 64L,
+  slot_size = 512L,
+  ident = NULL
+) {
+  ctrl <- .Call(
+    mizu:::mizu_pool_create,
+    workers,
+    max_submitters,
+    injection_cap,
+    per_worker_cap,
+    result_slots,
+    slot_size
+  )
+  suffix <- .Call(mizu:::mizu_pool_suffix, ctrl)
+  wks <- lapply(seq_len(workers) - 1L, function(slot) {
+    wk <- .Call(mizu:::mizu_pool_worker_join, suffix, slot, ident)
+    .Call(mizu:::mizu_pool_set_eval, wk)
+    wk
+  })
+  list(ctrl = ctrl, wk = wks[[1L]], wks = wks)
+}
+
+# One worker-loop iteration: 1 = executed a task, 0 = none, -1 = shutdown.
+# A task error longjmps out of the step — the eval hot path arms no
+# handler — so publish it as the task's ERR result, as worker_main does.
+pool_step <- function(p, timeout = 0, wk = p[["wk"]]) {
+  e <- tryCatch(
+    return(.Call(mizu:::mizu_pool_step, wk, timeout)),
+    error = function(e) e
+  )
+  if (.Call(mizu:::mizu_pool_run_outcome, wk, e) != 0L) {
+    stop(e)
+  }
+  1L
+}
+
+# Test-only: move up to n queued injection entries onto the worker's own
+# deque (the stand-in for Phase 3's nested submit)
+pool_pull <- function(p, n, wk = p[["wk"]]) {
+  .Call(mizu:::mizu_pool_deque_pull, wk, n)
+}
+
+# Orderly in-process teardown: the workers leave (their slots free), then
+# the controller destroys (broadcast + unlink + release).
+pool_end <- function(p) {
+  for (wk in p[["wks"]]) {
+    .Call(mizu:::mizu_pool_leave, wk)
+  }
+  .Call(mizu:::mizu_pool_destroy, p[["ctrl"]])
+}
+
+# Byte-level access to the region behind a root view, for layout tests:
+# view_peek(x) opens the region read-only and returns a reader of
+# (offset, n) -> raw. i64v() decodes little-endian int64 words whose high
+# halves are zero (layout counts and offsets are small); align64() is the
+# layouts' section alignment.
+view_peek <- function(x) {
+  rg <- .Call(
+    mizu:::mizu_region_open,
+    .Call(mizu:::mizu_zc_view_name, x),
+    FALSE
+  )
+  function(offset, n) .Call(mizu:::mizu_peek, rg, offset, n)
+}
+
+i64v <- function(r) {
+  w <- readBin(r, "integer", n = length(r) / 4, size = 4, endian = "little")
+  stopifnot(all(w[c(FALSE, TRUE)] == 0L))
+  as.numeric(w[c(TRUE, FALSE)])
+}
+
+align64 <- function(b) (b + 63) %/% 64 * 64
+
+# A poke-crafted remote-leaf (tag 33) fixture for the MIZL remote-leaf
+# reader: stage x (wrapped in a list by default) for region A and a
+# one-element list for region B through one channel pair, with an RW
+# mapping of B for poke_remote(), which rewrites B's directory entry 0 as
+# a remote leaf — the identifier span over the orphaned local leaf bytes
+# at offset 128 — so the consumer's lazy element extraction resolves it.
+remote_leaf_pair <- function(x, wrap = TRUE) {
+  p <- channel_pair(arena_size = 0)
+  mizu_send(p[["host"]], if (wrap) list(x) else x)
+  ya <- mizu_recv(p[["peer"]], 5)
+  aname <- .Call(mizu:::mizu_zc_view_name, ya)
+  mizu_send(p[["host"]], list(runif(40000)))
+  yb <- mizu_recv(p[["peer"]], 5)
+  rw <- .Call(
+    mizu:::mizu_region_open,
+    .Call(mizu:::mizu_zc_view_name, yb),
+    TRUE
+  )
+  list(
+    p = p,
+    ya = ya,
+    yb = yb,
+    rw = rw,
+    id = if (wrap) paste0(aname, "[1]") else aname
+  )
+}
+
+i64raw <- function(x) {
+  stopifnot(x >= 0 && x < 2^31)
+  c(
+    writeBin(as.integer(x), raw(), size = 4L, endian = "little"),
+    as.raw(rep(0L, 4L))
+  )
+}
+
+poke_remote <- function(
+  fx,
+  id = fx[["id"]],
+  len,
+  attrs = 0L,
+  sxp = 33L,
+  dsz = nchar(id, "bytes"),
+  doff = 128L
+) {
+  entry <- c(
+    i64raw(doff),
+    i64raw(dsz),
+    writeBin(as.integer(sxp), raw(), size = 4L, endian = "little"),
+    writeBin(as.integer(attrs), raw(), size = 4L, endian = "little"),
+    i64raw(len)
+  )
+  .Call(mizu:::mizu_poke, fx[["rw"]], 64, entry)
+  if (dsz > 0) {
+    .Call(mizu:::mizu_poke, fx[["rw"]], 128, charToRaw(id))
+  }
+  invisible(fx)
+}

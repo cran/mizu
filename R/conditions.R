@@ -1,0 +1,249 @@
+#' Error Conditions
+#'
+#' Terminal failures that a caller can act on programmatically are raised
+#' as classed conditions. Each inherits `"mizu_error"` (alongside `"error"`
+#' and `"condition"`), with a subclass that names the failure. Catch them
+#' with `tryCatch(..., mizu_error_worker_died = ...)` or test with
+#' [inherits()] instead of matching message text. Messages are not API and
+#' can be reworded. The class vectors and fields below are API.
+#'
+#' The subclasses, where they are raised, and the structured fields they
+#' carry as condition elements:
+#'
+#' * `mizu_error_submit_timeout` — [mizu_submit()] on `.timeout` expiry with
+#'   the injection ring of the submitter still full.
+#' * `mizu_error_slots_exhausted` — [mizu_submit()] and [mizu_map()] when
+#'   every result slot in the subrange of the submitter is already
+#'   outstanding. Collect or cancel before resubmitting.
+#' * `mizu_error_stopped` — [mizu_submit()], [mizu_map()] and
+#'   [mizu_pool_attach()] against a pool that was stopped or whose owner
+#'   process died.
+#' * `mizu_error_cancelled` — [mizu_collect()] on a task that was cancelled
+#'   or whose pool was stopped.
+#' * `mizu_error_worker_died` — [mizu_collect()] on a task whose executing
+#'   worker died. Fields `slot` (worker registry slot, 0-based as in
+#'   [mizu_pool_dump()]) and `pid`: the claimant record of the result slot, read
+#'   at collect time. This is informational, can race with slot reuse as
+#'   [mizu_pool_dump()] does, and is `NA` where no claim was recorded.
+#'   [mizu_map()] signals this class with the lost elements as an additional
+#'   `lost` field: a two-column matrix of inclusive `lo, hi` ranges,
+#'   runner-granular and conservative (see the Errors section of [mizu_map()]).
+#'   pymizu's `WorkerDiedError.lost` carries the same set as a list of 0-based
+#'   half-open `[lo, hi)` spans.
+#' * `mizu_error_task_lost` — [mizu_collect()] on a task whose payload region
+#'   vanished before any worker could read it (its submitter died or released
+#'   the pool with the task still queued). Unlike `mizu_error_worker_died`, no
+#'   worker death is involved, and the task never started executing anywhere.
+#' * `mizu_error_startup` — [mizu_channel()], [mizu_pool()] and
+#'   [mizu_spawn_workers()] when a child process fails to attach within
+#'   `startup_timeout`.
+#' * `mizu_error_shm` — shared-memory region create or open failure
+#'   anywhere in the API. Field `bytes`: the requested size of a
+#'   region that was not created, `NA` when a region was not opened.
+#' * `mizu_error_python_payload` — [mizu_recv()] or [mizu_recv_batch()]
+#'   on a channel message written in a language-private stream (a pymizu
+#'   codec or pickle payload) that this reader cannot interpret. The
+#'   portable interchange subset crosses; the declined message is
+#'   consumed, so the channel keeps flowing.
+#' * `mizu_error_not_portable` — [mizu_send()] on a channel whose peer is
+#'   a foreign-language process, of a value outside the portable
+#'   interchange subset (a named atomic vector, an environment, a
+#'   closure, an S4 object, an ordered factor, a data frame subclass,
+#'   and the like). Fields `path` (where in the value the walk
+#'   declined), `reason`, and `remedy` (a one-line rewrite where one
+#'   exists, else `character(0)`).
+#' * `mizu_error_remote` — never raised by mizu itself: the value a
+#'   channel receive returns for a remote error stream, most commonly a
+#'   peer process whose expression errored (the peer shims send one
+#'   before exit, on every channel). Fields `remote_type` (the
+#'   most-specific class of the original error), `message`, `detail`
+#'   (the call or traceback text), and `index` (the 1-based element
+#'   index) when the remote error carries one. Test with
+#'   [mizu_is_remote_error()]; signal it with `stop(x)`.
+#'
+#' Errors of misuse (unnamed task arguments, out-of-range slots, operations
+#' on a closed handle) stay plain errors: the classed hierarchy covers the
+#' outcomes that a running system produces, not programming mistakes.
+#'
+#' Raised `mizu_error` conditions are distinct from sentinels (class
+#' `mizu_sentinel`, returned by [mizu_send()], [mizu_recv()] and
+#' [mizu_collect()]). A sentinel is an ordinary return value that marks a
+#' terminal state, not a signalled condition. See
+#' [mizu_is_sentinel()].
+#'
+#' Which of the two you get depends on the shape of the call. The functions that
+#' move payloads and wait with a bound ([mizu_send()], [mizu_recv()],
+#' [mizu_collect()], [mizu_map()]) return sentinels for transport states:
+#' nothing yet (`mizu_timeout`), no room now (`mizu_full`), and stream over
+#' (`mizu_closed`, `mizu_peer_gone`). Their caller is a loop, and these are its
+#' normal outcomes. Conditions are raised where a request has failed for good.
+#' Constructors and [mizu_submit()], whose return value is a handle the next
+#' line uses, raise on every failure. [mizu_collect()] raises when the value can
+#' never arrive: the task's own error re-signalled, `mizu_error_cancelled`, or
+#' `mizu_error_worker_died`. A sentinel invites the next iteration of the loop,
+#' and a condition means stop and deal with it.
+#'
+#' @section Task error transport:
+#' A task's own error, re-signalled by [mizu_collect()] (and
+#' [mizu_collect_any()] / [mizu_collect_all()]), is a transport condition
+#' built on the worker at publish time. The caught condition itself never
+#' crosses, so a condition that cannot be serialized can never kill the
+#' worker. The transport condition carries the original classes, the raw
+#' `message` field (custom `conditionMessage()` methods are bypassed;
+#' the message is truncated past its share of the result slot's inline
+#' budget), `call`, and every named field the compact payload codec can
+#' carry within that budget, in the priority order message, `call`,
+#' fields, then `dropped_fields`. Fields the codec cannot carry
+#' (environments, closures, S4 objects, ALTREP vectors, external
+#' pointers) and fields past the remaining budget are dropped and named
+#' in a `dropped_fields` field, absent when nothing was dropped. Only
+#' the named elements of a condition are considered: an unnamed element
+#' cannot be named in `dropped_fields` and is dropped silently.
+#'
+#' @name mizu_error
+#' @aliases mizu_error_submit_timeout mizu_error_slots_exhausted mizu_error_stopped mizu_error_cancelled mizu_error_worker_died mizu_error_task_lost mizu_error_startup mizu_error_shm mizu_error_not_portable mizu_error_python_payload mizu_error_remote
+NULL
+
+# Raise a classed mizu error — class c(subclass, "mizu_error", "error",
+# "condition"), structured fields in `...` — matching the C-side mizu_stop
+# (condition.c).
+stop_mizu <- function(subclass, message, ...) {
+  stop(errorCondition(message, ..., class = c(subclass, "mizu_error")))
+}
+
+# The rejection constructors of the promise surface (R/promise.R): terminal
+# transport states cross as classed *errors* whose class names match the
+# sentinels, so inherits(x, "mizu_closed") works on either form. Sentinels
+# remain the sync API's values; these are never signalled by the sync verbs.
+cond_closed <- function() {
+  errorCondition(
+    "mizu: channel is closed",
+    class = c("mizu_closed", "mizu_error")
+  )
+}
+
+cond_peer_gone <- function() {
+  errorCondition(
+    "mizu: channel peer process died",
+    class = c("mizu_peer_gone", "mizu_error")
+  )
+}
+
+cond_timeout <- function() {
+  errorCondition(
+    "mizu: operation timed out",
+    class = c("mizu_timeout", "mizu_error")
+  )
+}
+
+cond_stopped <- function() {
+  errorCondition(
+    "mizu: pool stopped",
+    class = c("mizu_error_stopped", "mizu_error")
+  )
+}
+
+# The startup-timeout failure shared by every constructor that spawns
+# children: `what` is "child" (a channel peer) or "workers" (a pool's).
+stop_startup <- function(what, timeout) {
+  stop_mizu(
+    "mizu_error_startup",
+    paste0(
+      "mizu: ",
+      what,
+      " failed to attach within ",
+      format(timeout),
+      " seconds"
+    )
+  )
+}
+
+# Guards the '...' separator of the constructor signatures: whatever lands
+# there is a typo or a positional leftover, never an intended argument.
+check_dots_empty <- function(...) {
+  n <- ...length()
+  if (n == 0L) {
+    return(invisible())
+  }
+  nms <- ...names()
+  what <- if (!is.null(nms) && all(nzchar(nms))) {
+    paste0(": '", paste(nms, collapse = "', '"), "'")
+  } else {
+    ""
+  }
+  stop(
+    "mizu: unused argument(s)",
+    what,
+    " \u2014 options after '...' must be given by name",
+    call. = FALSE
+  )
+}
+
+# The seconds validation shared by every wait: one number, never NA — an
+# NA/NaN would read as an indefinite wait (as mizu_r_timeout_arg).
+check_timeout <- function(x, arg = "timeout") {
+  if (!is.numeric(x) || length(x) != 1L || is.na(x)) {
+    stop(
+      sprintf("mizu: %s must be a number of seconds, not NA", arg),
+      call. = FALSE
+    )
+  }
+  invisible()
+}
+
+#' Test for a mizu Sentinel
+#'
+#' Tests identity against the four sentinel values (`mizu_full`, `mizu_timeout`,
+#' `mizu_closed`, `mizu_peer_gone`) that mizu's functions return to signal
+#' terminal states. `inherits(x, "mizu_sentinel")` tests the class alone, which
+#' any payload can carry, and even a genuine sentinel forwarded over a channel
+#' arrives as an ordinary copy. `mizu_is_sentinel()` returns `TRUE` only for the
+#' sentinel objects that mizu's own calls returned in this process, so code that
+#' relays untrusted values can tell its terminal states from look-alike
+#' payloads.
+#'
+#' Sentinels are ordinary values, not R conditions: nothing is signalled,
+#' and condition handlers never see them.
+#'
+#' @param x any R object.
+#'
+#' @return `TRUE` or `FALSE`.
+#'
+#' @examples
+#' mizu_is_sentinel(42)
+#' # class alone does not make a sentinel:
+#' mizu_is_sentinel(structure("x", class = c("mizu_timeout", "mizu_sentinel")))
+#'
+#' @export
+mizu_is_sentinel <- function(x) .Call(mizu_sentinel_check, x)
+
+#' Remote Errors
+#'
+#' A channel receive returns a remote error as a value, not a raised condition:
+#' an error in the peer is data until your code decides otherwise. The value is
+#' a `mizu_error_remote` condition (see [mizu_error]). It is an ordinary
+#' condition object, so it prints, and `conditionMessage()` leads with
+#' `remote_type: message`.
+#'
+#' `mizu_is_remote_error()` tests the class. Signal it with `stop(x)`, and
+#' handlers dispatch on its classes (`mizu_error_remote`, then `mizu_error`,
+#' `error`, `condition`).
+#'
+#' @param x any R object.
+#'
+#' @return `TRUE` or `FALSE`.
+#'
+#' @examples
+#' ch <- mizu_channel(quote(stop("boom")))
+#' x <- mizu_recv(ch, timeout = 5)
+#' mizu_is_remote_error(x)
+#' conditionMessage(x)
+#' mizu_close(ch)
+#'
+#' @export
+mizu_is_remote_error <- function(x) inherits(x, "mizu_error_remote")
+
+#' @export
+conditionMessage.mizu_error_remote <- function(c) {
+  paste0(c$remote_type, ": ", c$message)
+}

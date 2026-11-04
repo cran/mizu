@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.19">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Task pools</title>
+<style>
+
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+width: 0.8em;
+margin: 0 0.8em 0.2em -1em;  vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+}
+pre.numberSource { margin-left: 3em; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+</style>
+</head>
+
+<body>
+
+
+<header id="title-block-header">
+<h1 class="title">Task pools</h1>
+
+</header>
+
+<nav id="TOC" role="doc-toc">
+    <h2 id="toc-title">Table of contents</h2>
+   
+  <ul>
+  <li><a href="#nested-tasks" id="toc-nested-tasks">Nested tasks</a></li>
+  <li><a href="#a-default-pool-for-package-code" id="toc-a-default-pool-for-package-code">A default pool for package code</a></li>
+  <li><a href="#waiting-on-several-tasks" id="toc-waiting-on-several-tasks">Waiting on several tasks</a></li>
+  <li><a href="#promises-and-handlers" id="toc-promises-and-handlers">Promises and handlers</a></li>
+  <li><a href="#sizing-sharing-and-watching-a-pool" id="toc-sizing-sharing-and-watching-a-pool">Sizing, sharing and watching a pool</a></li>
+  </ul>
+</nav>
+<p><code>mizu_pool()</code> builds on the same shared-memory transport as a channel. It spawns worker processes that each own a work-stealing deque, with no dispatcher process in between. A submitted task goes from your process into shared memory, where a worker claims it. Idle workers steal from busy ones, so the load balances itself.</p>
+<p><code>mizu_submit()</code> captures an expression together with the values it needs and returns a task handle immediately. Your session stays free to continue. <code>mizu_collect()</code> waits for the result of that task:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(mizu)</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>p <span class="ot">&lt;-</span> <span class="fu">mizu_pool</span>(<span class="at">n_workers =</span> <span class="dv">4</span>L)</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>t <span class="ot">&lt;-</span> <span class="fu">mizu_submit</span>(p, <span class="fu">sum</span>(x) <span class="sc">+</span> y, <span class="at">x =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">10</span>, <span class="at">y =</span> <span class="dv">100</span>)</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_collect</span>(t)</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 155</span></span></code></pre></div>
+<p>If a task raises an error, the pool captures it and signals it again in your session when you collect the result. <code>mizu_cancel(t)</code> withdraws a task. A task still queued is skipped. A task already running completes, and its result is discarded. Cancellation never interrupts executing code.</p>
+<h2 id="nested-tasks">Nested tasks</h2>
+<p>Inside a task, <code>mizu_current_pool()</code> returns the handle of the worker running it, so a task can split itself into subtasks. A nested submit pushes onto that worker’s own work-stealing deque, so there is no ring and no wake-up. A worker waiting on a nested result executes other work instead of sleeping. Divide-and-conquer has little overhead and cannot deadlock the pool:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>t <span class="ot">&lt;-</span> <span class="fu">mizu_submit</span>(</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  p,</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  {</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    subtasks <span class="ot">&lt;-</span> <span class="fu">lapply</span>(</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>      parts,</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>      \(part) <span class="fu">mizu_submit</span>(<span class="fu">mizu_current_pool</span>(), <span class="fu">sum</span>(x), <span class="at">x =</span> part)</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">do.call</span>(sum, <span class="fu">lapply</span>(subtasks, mizu_collect))</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>  },</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">parts =</span> <span class="fu">split</span>(<span class="dv">1</span><span class="sc">:</span><span class="dv">1000</span>, <span class="fu">rep</span>(<span class="dv">1</span><span class="sc">:</span><span class="dv">4</span>, <span class="at">each =</span> <span class="dv">250</span>))</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_collect</span>(t)</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 500500</span></span></code></pre></div>
+<p><code>mizu_map()</code> nests the same way: a task can map over its own pool with <code>mizu_map(mizu_current_pool(), ...)</code>. See <a href="map.html#nested-maps">Nested maps</a>.</p>
+<h2 id="a-default-pool-for-package-code">A default pool for package code</h2>
+<p>Package code can read a process-wide default pool with <code>mizu_default_pool()</code>. <code>mizu_set_default_pool()</code> sets it (or clears it with <code>NULL</code>) and invisibly returns the previous default, so you can save and restore it. A pool set as the default stays alive even after its variable is removed. <code>mizu_with_pool()</code> scopes the default to an expression, <code>mizu_local_pool()</code> to the calling frame. Both restore the previous default on exit.</p>
+<p>Resolve an optional pool in this order: an explicit <code>pool</code> argument, <code>mizu_current_pool()</code> inside a task, <code>mizu_default_pool()</code>, then your own fallback, such as sequential evaluation or an error. Inside a task, <code>mizu_current_pool()</code> takes precedence over the default, so nested submission always goes to the worker’s own pool. Setting a default checks only the type: a stopped pool is accepted and fails when used. Handles from <code>mizu_pool_attach()</code> are valid defaults.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>run <span class="ot">&lt;-</span> <span class="cf">function</span>(x, <span class="at">pool =</span> <span class="fu">mizu_default_pool</span>()) {</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">is.null</span>(pool)) {</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">stop</span>(<span class="st">&quot;no pool: pass one, or set a default&quot;</span>, <span class="at">call. =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mizu_collect</span>(<span class="fu">mizu_submit</span>(pool, x <span class="sc">*</span> <span class="dv">2</span>L, <span class="at">x =</span> x))</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>old <span class="ot">&lt;-</span> <span class="fu">mizu_set_default_pool</span>(p)</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="fu">run</span>(<span class="dv">21</span>L)</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 42</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_set_default_pool</span>(old)</span></code></pre></div>
+<h2 id="waiting-on-several-tasks">Waiting on several tasks</h2>
+<p><code>mizu_collect_any()</code> waits on a list of task handles and returns <code>list(index, value)</code> for the first to reach a terminal state, in completion order rather than submission order. The other handles stay collectible. <code>mizu_collect_all()</code> waits until every task is terminal and returns all values in input order, with the names of the handle list carried over. Both take one overall <code>timeout</code> and return the <code>mizu_timeout</code> sentinel on expiry, consuming nothing. An outcome that raises (the task’s own error, a cancelled task, a dead worker) carries a 1-based <code>index</code> field with the handle’s position, and only that handle is consumed:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>slow <span class="ot">&lt;-</span> <span class="fu">mizu_submit</span>(p, { <span class="fu">Sys.sleep</span>(<span class="fl">0.5</span>); <span class="st">&quot;slow&quot;</span> })</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>fast <span class="ot">&lt;-</span> <span class="fu">mizu_submit</span>(p, <span class="st">&quot;fast&quot;</span>)</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_collect_any</span>(<span class="fu">list</span>(slow, fast), <span class="at">timeout =</span> <span class="dv">5</span>)</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; $index</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 2</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; $value</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] &quot;fast&quot;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_collect</span>(slow)</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] &quot;slow&quot;</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>ts <span class="ot">&lt;-</span> <span class="fu">list</span>(</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">total =</span> <span class="fu">mizu_submit</span>(p, <span class="fu">sum</span>(x), <span class="at">x =</span> <span class="fu">runif</span>(<span class="dv">10</span>)),</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">label =</span> <span class="fu">mizu_submit</span>(p, <span class="st">&quot;done&quot;</span>)</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_collect_all</span>(ts, <span class="at">timeout =</span> <span class="dv">5</span>)</span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; $total</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 3.628258</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; $label</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] &quot;done&quot;</span></span></code></pre></div>
+<p>On the submit side, <code>mizu_submit_batch()</code> submits one task per element of a list of pre-quoted expressions in a single call. The whole burst crosses into shared memory once, with one wake-up sweep, and the <code>...</code> arguments are shared by every task:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>ts <span class="ot">&lt;-</span> <span class="fu">mizu_submit_batch</span>(p, <span class="fu">list</span>(<span class="fu">quote</span>(<span class="dv">1</span> <span class="sc">+</span> <span class="dv">1</span>), <span class="fu">quote</span>(<span class="dv">2</span> <span class="sc">+</span> <span class="dv">2</span>)))</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_collect_all</span>(ts, <span class="at">timeout =</span> <span class="dv">5</span>)</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [[1]]</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 2</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [[2]]</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 4</span></span></code></pre></div>
+<h2 id="promises-and-handlers">Promises and handlers</h2>
+<p>In an event-driven program, call <code>then()</code> directly on a task handle. <code>then(task, fn)</code> (or <code>as.promise(task)</code>) resolves with the task’s value and rejects with the classed condition that <code>mizu_collect()</code> would raise, including worker death. <code>mizu_collect_all_async()</code> and <code>mizu_collect_any_async()</code> are the async forms of the collective functions, with one promise per collection. Collect-all resolves in input order with names carried over, and rejects with <code>index</code> on the first erroring handle by position. Collect-any resolves <code>list(index, value)</code>. A map handle works the same way: <code>then(map_handle, fn)</code> resolves with the whole gathered result. This needs the <code>later</code> and <code>promises</code> packages.</p>
+<p>There is one promise per collection, not per task. A promise costs tens of microseconds of R work against about a microsecond of transport, so a map of ten thousand elements resolves one promise rather than ten thousand. A burst of results produces one wake-up no matter how many workers published it, and every main-thread drain is bounded per event-loop turn and re-scheduled.</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(promises)</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>slow <span class="ot">&lt;-</span> <span class="fu">mizu_submit</span>(p, { <span class="fu">Sys.sleep</span>(<span class="fl">0.2</span>); <span class="st">&quot;slow&quot;</span> })</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">then</span>(slow, print)</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>m <span class="ot">&lt;-</span> <span class="fu">mizu_map</span>(p, <span class="dv">1</span><span class="sc">:</span><span class="dv">100</span>, \(i) i <span class="sc">*</span> i, <span class="at">.template =</span> <span class="fu">integer</span>(<span class="dv">1</span>))</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="fu">then</span>(m, \(v) <span class="fu">print</span>(<span class="fu">sum</span>(v)))</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (i <span class="cf">in</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">8</span>) later<span class="sc">::</span><span class="fu">run_now</span>(<span class="dv">1</span>) <span class="co"># pump the loop until the resolutions land</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] 338350</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="co">#&gt; [1] &quot;slow&quot;</span></span></code></pre></div>
+<p>A task with a promise attached, or one that is part of a pending async collection, refuses a blocking <code>mizu_collect()</code> and a second promise: each result has one consumer. <code>mizu_cancel()</code> is still allowed, and the pending promise then rejects.</p>
+<h2 id="sizing-sharing-and-watching-a-pool">Sizing, sharing and watching a pool</h2>
+<p>A pool can grow and shrink while it runs. Retirement never interrupts a task: the worker finishes its current task, and the remaining workers take over anything still queued to it. Other R processes can join a running pool as submitters. They need only the pool’s join token:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_spawn_workers</span>(p, <span class="at">n =</span> <span class="dv">2</span>L)     <span class="co"># two more workers join the pool</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_retire_worker</span>(p, <span class="at">slot =</span> <span class="dv">0</span>L)  <span class="co"># worker 0 exits after its current task</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="co"># in another R process, submit and collect exactly as the creator does:</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>p2 <span class="ot">&lt;-</span> <span class="fu">mizu_pool_attach</span>(token)     <span class="co"># token: mizu_pool_info(p)$token on the creator</span></span></code></pre></div>
+<p>Four read-only tools observe a running pool without disturbing it:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_pool_info</span>(p)  <span class="co"># snapshot: worker states, queued tasks, result slots</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_pool_stats</span>(p)   <span class="co"># cumulative counters: tasks run, steals, parks per worker</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_pool_dump</span>(p)    <span class="co"># every slot in full detail; start here when a pool hangs</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_pool_trace</span>(p, \(event, id) <span class="fu">message</span>(event, <span class="st">&quot; &quot;</span>, id))  <span class="co"># task lifecycle hook</span></span></code></pre></div>
+<p>When you are done, <code>mizu_pool_stop()</code> cancels the pending tasks, waits for the workers to exit cleanly, and releases the shared region:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mizu_pool_stop</span>(p)</span></code></pre></div>
+
+
+
+
+
+</body></html>

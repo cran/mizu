@@ -1,81 +1,48 @@
-# a channel prints its state and buffer occupancy
+# mizu_channel rejects misspelled and positional options
 
     Code
-      print(ch)
-    Output
-      <mizu_inproc_channel: open, 0/2 buffered>
-
----
-
-    Code
-      print(ch)
-    Output
-      <mizu_inproc_channel: open, 1/2 buffered>
-
----
-
-    Code
-      print(ch)
-    Output
-      <mizu_inproc_channel: closed, 1/2 buffered>
-
----
-
-    Code
-      print(ch)
-    Output
-      <mizu_inproc_channel: closed, 0/2 buffered>
-
-# sentinels print as their class
-
-    Code
-      print(mizu_full)
-    Output
-      <mizu_full>
-
----
-
-    Code
-      print(mizu_timeout)
-    Output
-      <mizu_timeout>
-
----
-
-    Code
-      print(mizu_closed)
-    Output
-      <mizu_closed>
-
-# misuse is a plain error
-
-    Code
-      mizu_inproc_channel(0)
+      mizu_channel(quote(NULL), 1024L)
     Condition
       Error:
-      ! mizu: capacity must be a positive integer
+      ! mizu: unused argument(s) — options after '...' must be given by name
 
 ---
 
     Code
-      mizu_inproc_channel(1.5)
+      mizu_channel(quote(NULL), spin_mode = TRUE)
     Condition
       Error:
-      ! mizu: capacity must be a positive integer
+      ! mizu: unused argument(s): 'spin_mode' — options after '...' must be given by name
+
+# mizu_channel_create rejects fractional and NA geometry
+
+    Code
+      .Call(mizu:::mizu_channel_create, quote(NULL), 4.9, 256L, 0, FALSE)
+    Condition
+      Error:
+      ! mizu: capacity must be a whole number
 
 ---
 
     Code
-      mizu_recv("x")
+      .Call(mizu:::mizu_channel_create, quote(NULL), 64L, 256L, 64.5, FALSE)
     Condition
       Error:
-      ! mizu: ch must be a channel created by mizu_inproc_channel()
+      ! mizu: arena_size must be a whole number
 
 ---
 
     Code
-      mizu_recv(mizu_inproc_channel(1), timeout = -1)
+      .Call(mizu:::mizu_channel_create, quote(NULL), NA_integer_, 256L, 0, FALSE)
     Condition
       Error:
-      ! mizu: timeout must be a non-negative number
+      ! mizu: capacity must be a whole number
+
+# the channel attach entry rejects an NA suffix
+
+    Code
+      .Call(mizu:::mizu_channel_attach, NA_character_, NULL)
+    Condition
+      Error:
+      ! mizu: suffix must not be NA
 

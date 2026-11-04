@@ -1,0 +1,15 @@
+# mizu_py_launcher probes the interpreter for pymizu
+
+    Code
+      mizu_py_launcher(python = "/nonexistent/python3")
+    Condition
+      Error:
+      ! mizu: mizu_py_launcher() cannot find the Python interpreter '/nonexistent/python3'
+
+# mizu_py_launcher needs a python3 on the PATH by default
+
+    Code
+      out
+    Output
+      [1] "mizu: mizu_py_launcher() needs python3 on the PATH (or pass python)"
+

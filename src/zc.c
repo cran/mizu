@@ -1,0 +1,1255 @@
+/* Zero-copy payload tiers (zc.c): SHM_VEC — a view-layout object (atomic
+   vector, string vector, or list tree) in a spill region, wrapped ALTREP
+   at receive (no allocVector, no memcpy, no parse) — and REF — the /mizu_
+   identifier of an object already in shared memory, resolved to a view of
+   the same pages. The receive machinery is the view layer (view.c);
+   what zc.c adds is the cross-process release protocol: a
+   refcount in the region header's reserved bytes (mizu.h), a per-handle
+   lent-region ledger on the producer, and a once-only release callback
+   per view (the layer's embedder release hook — fired at COW materialization or at the
+   view finalizer, whichever comes first; list views fire at the finalizer
+   only, since extracted element views keep referencing the region).
+
+   Ordering invariant: the consumer's refcount add happens at wrap, before
+   its consumer-done signal (head publish / result-slot release), which
+   happens-before the producer's loan drop at the keeper release points —
+   so refcount 0 means no live views and reuse can't disturb a consumer.
+   An add any later (e.g. lazily at first access) would race the sweep.
+
+   Views nested inside a larger payload (a pool task's argument list, a
+   list crossing a channel) never reach the top-level tier selection: R's
+   serializer emits their identifiers via the vendored Serialized_state
+   hooks and the far side resolves them inside R_Unserialize. Mori's wire
+   hooks (mizu_view_set_wire_hooks, set at load) keep that path inside the
+   protocol: emit marks the region REFHELD (the holder set widens beyond
+   the direct peer), resolve does the counted add and arms the release
+   callback before the read returns — which happens-before the
+   consumer-done signal, the sender's keeper pinning the payload (and
+   with it the view) until then. */
+
+#include <stdlib.h>
+#include <R_ext/Utils.h>
+#include "mizu.h"
+
+static SEXP mizu_rel_tag;      /* the release-record extptr */
+static SEXP mizu_shm_tag_sym;  /* installed MIZU_VIEW_TAG_SHM: the chain terminus */
+
+/* The by-reference traffic record (F1's retain protocol). One small
+   process-global list, a preserved container refilled per pass — safe
+   because R staging is single-threaded per process (pool workers are
+   separate processes):
+
+   - the mark list: every view a by-reference emission marked REFHELD
+     since the last reset (the REF tier's claim, the serialize fallback's
+     wire-hook emissions, the 'I' ref gate's). Non-empty is the stage's
+     pin-and-no-keeperless signal (conservative — pin when unsure — is
+     the correct failure direction); coverage is definitional because
+     every emission funnels through the one mark. A worker's outcome
+     write resets it once the publish has consumed it — the records hold
+     views, so a count-only reset would pin them across tasks.
+
+   A worker's decoded argument loans ride the views' ordinary release
+   records (GC-gated), like every other view flow: there is no
+   deterministic outcome-write fire. R's public API has no exact
+   reference count (REFCNT is libR-internal and off-limits), and the
+   eval's own machinery — the spliced call cells, the callee frame's
+   promise bindings — keeps an unkept argument referenced past the
+   eval, so nothing short of a collection can tell one from a view the
+   task's R code kept. */
+static int mizu_zc_nmarks;
+
+/* The boundary counter: region bytes whose release records armed since the
+   last boundary collection — the view-pin pressure R's own gc cadence
+   cannot see (a view is ~100 B of R heap over MBs of shm). A region
+   charges on the first arm of its pending lifetime only (the set below):
+   an aliased re-wrap of a region with an armed-unreleased record
+   re-charges nothing, so relaying one big region per verb cannot fire the
+   boundary per frame. */
+static size_t mizu_zc_armed;
+
+/* The firing threshold: MIZU_R_GC_BYTES unless the mizu.gc_boundary option
+   overrides it at package load (0 disables, returning loans to R's gc
+   cadence). A plain static — the verb path pays one load and compare. */
+static size_t mizu_zc_gc_bytes = MIZU_R_GC_BYTES;
+
+/* The dedup: a re-arm of a region with a record already armed rides the
+   standing charge — the case the per-wrap charge broke on (one big
+   region re-wrapped per receive, a REF relay) hits one of these slots
+   every wrap, so it cannot fire the boundary per frame. The slots cover
+   one region wrapped through the several mappings an in-process relay
+   resolves; past them, interleaved regions degrade to the old
+   charge-per-wrap (an over-charge, the safe direction). A hash set here
+   measured as a broad fire-rate tax (every release finalizer paid the
+   remove at GC time): a short scan of static storage instead. */
+#define ZC_ARMED_SLOTS 8
+static const mizu_shm *zc_armed_recent[ZC_ARMED_SLOTS];
+static int zc_armed_next;
+
+static void zc_list_clear(SEXP list, int *pn) {
+  const int n = *pn;
+  for (int i = 0; i < n; i++)
+    SET_VECTOR_ELT(list, i, R_NilValue);
+  *pn = 0;
+}
+
+void mizu_zc_ref_reset(void) {
+  /* nmarks == 0 is exactly "already empty" (pushes append, the clear
+     NILs): the common attr-free stage pays one load, never the root
+     chase */
+  if (mizu_zc_nmarks > 0)
+    zc_list_clear(mizu_priv(MIZU_PRIV_ZC_MARKS), &mizu_zc_nmarks);
+}
+int mizu_zc_ref_fired(void) { return mizu_zc_nmarks > 0; }
+
+/* Append to the mark list on the precious root, doubling on growth. The
+   pushed view is always anchored elsewhere already (the staged object), so
+   the list is a record, never the last reference. */
+static void zc_list_push(int *pn, SEXP x) {
+  const int n = *pn;
+  SEXP list = mizu_priv(MIZU_PRIV_ZC_MARKS);
+  if (n >= XLENGTH(list)) {
+    SEXP bigger = PROTECT(Rf_allocVector(VECSXP, n == 0 ? 8 : 2 * n));
+    for (int i = 0; i < n; i++)
+      SET_VECTOR_ELT(bigger, i, VECTOR_ELT(list, i));
+    mizu_priv_set(MIZU_PRIV_ZC_MARKS, bigger);
+    UNPROTECT(1);
+    list = bigger;
+  }
+  SET_VECTOR_ELT(list, n, x);
+  *pn = n + 1;
+}
+
+void mizu_zc_ref_mark(SEXP x);
+static void mizu_zc_wire_resolve(SEXP view, mizu_shm *shm);
+typedef struct mizu_zc_rel_s mizu_zc_rel;
+static void mizu_zc_mizl_loans(unsigned char *base, int64_t region_size,
+                               mizu_zc_rel *rel);
+
+void mizu_zc_init(void) {
+  mizu_rel_tag = Rf_install("mizu_view_release");
+  mizu_shm_tag_sym = Rf_install(MIZU_VIEW_TAG_SHM);
+  SEXP marks = PROTECT(Rf_allocVector(VECSXP, 0));
+  mizu_priv_set(MIZU_PRIV_ZC_MARKS, marks);
+  /* the boundary collection's cached call: .Internal(gc(FALSE, FALSE,
+     FALSE)) — a level-0 collection of New space, then the pending
+     finalizers (do_gc's three-argument form predates the R >= 4.3 floor) */
+  SEXP f = PROTECT(Rf_ScalarLogical(FALSE));
+  SEXP inner = PROTECT(Rf_lang4(Rf_install("gc"), f, f, f));
+  SEXP gc = PROTECT(Rf_lang2(Rf_install(".Internal"), inner));
+  mizu_priv_set(MIZU_PRIV_GC_MINOR, gc);
+  UNPROTECT(4);
+  mizu_view_set_wire_hooks(mizu_zc_ref_mark, mizu_zc_wire_resolve);
+  /* the vendored resolve cache opens through mizu's split open, so every
+     consumer mapping — cached or prep-path — has a writable page 0 */
+  mizu_view_set_open_hook(mizu_zc_open);
+}
+
+void mizu_zc_fini(void) {
+  /* no release — the precious root outlives it (the unload order) */
+  mizu_priv_set(MIZU_PRIV_ZC_MARKS, R_NilValue);
+  mizu_priv_set(MIZU_PRIV_GC_MINOR, R_NilValue);
+  mizu_zc_armed = 0;
+  mizu_zc_nmarks = 0;
+  for (int i = 0; i < ZC_ARMED_SLOTS; i++) zc_armed_recent[i] = NULL;
+  zc_armed_next = 0;
+}
+
+// View release ------------------------------------------------------------------
+
+/* One per wrapped view: the refcount sub, armed only after the add lands
+   (a longjmp between wrap and add must not sub a count it never added).
+   pid is the fork guard (the view layer's host-finalizer pattern): views are
+   ordinary R objects that cross mclapply forks, and a child-side GC must
+   not sub a count it never added. shm is the view's mapping handle —
+   the prep path's own, or the vendored resolve cache's shared one (pinned
+   by the view's keeper chain there, never by the record). loans holds the
+   counted adds an MIZL wrap took on its remote leaves' regions (the lazy
+   element reader would count them only at first access — after the
+   consumer-done signal — leaving the regions recyclable underneath):
+   one fresh mapping + counted loan per distinct region, subs and closes
+   with the record. */
+typedef struct mizu_zc_rel_s {
+  mizu_shm *shm;
+  long pid;
+  int armed;
+  mizu_shm **loans;
+  int nloans;
+  int loans_cap;
+} mizu_zc_rel;
+
+/* The shared teardown: the armed sub and every loan, pid-guarded like the
+   main count; the loan mappings close unconditionally (a child's copy of
+   a mapping is its own to release, the consumer finalizer's discipline). */
+static void mizu_zc_rel_destroy(mizu_zc_rel *rel) {
+  if (rel->armed && rel->pid == mizu_self_pid()) {
+    mizu_zc_unref(rel->shm);
+    for (int i = 0; i < ZC_ARMED_SLOTS; i++)
+      if (zc_armed_recent[i] == rel->shm) {
+        zc_armed_recent[i] = NULL;
+        break;
+      }
+  }
+  for (int i = 0; i < rel->nloans; i++) {
+    mizu_shm *loan = rel->loans[i];
+    if (rel->pid == mizu_self_pid())
+      mizu_zc_unref(loan);
+    mizu_shm_close_stack(loan, 0);
+    free(loan);
+  }
+  free(rel->loans);
+  free(rel);
+}
+
+static void mizu_rel_finalizer(SEXP ptr) {
+  mizu_zc_rel *rel = (mizu_zc_rel *) R_ExternalPtrAddr(ptr);
+  if (rel != NULL) {
+    mizu_zc_rel_destroy(rel);
+    R_ClearExternalPtr(ptr);
+  }
+}
+
+/* The mizu_view_owned release hook: run the finalizer early (it clears the
+   extptr, so the GC pass is a no-op). Fires at COW materialization — the
+   shared pages are dead weight from there. */
+static void mizu_zc_rel_fire(void *arg) {
+  mizu_rel_finalizer((SEXP) arg);
+}
+
+// The boundary collection -----------------------------------------------------------
+
+/* Arm a release record and charge its region to the boundary counter: once
+   per region per pending lifetime — a re-wrap of a region with a standing
+   armed record rides the first arm's charge (the region is unrecyclable
+   while pinned, so the boundary loses nothing). Releases never refund;
+   eviction and re-open over-charges, the safe direction. The insert runs
+   before the record arms, so its raise leaves the finalizer with nothing
+   to decrement. */
+static void mizu_zc_rel_arm(mizu_zc_rel *rel, const mizu_shm *shm) {
+  int hit = 0;
+  for (int i = 0; i < ZC_ARMED_SLOTS; i++)
+    if (zc_armed_recent[i] == shm) {
+      hit = 1;
+      break;
+    }
+  if (!hit) {
+    mizu_zc_armed += shm->size;
+    zc_armed_recent[zc_armed_next] = shm;
+    zc_armed_next = (zc_armed_next + 1) % ZC_ARMED_SLOTS;
+  }
+  rel->armed = 1;
+}
+
+static void mizu_zc_gc_run(void *data) {
+  (void) data;
+  Rf_eval(mizu_priv(MIZU_PRIV_GC_MINOR), R_BaseEnv);
+}
+
+void mizu_zc_gc_boundary(void) {
+  if (mizu_zc_gc_bytes == 0 || mizu_zc_armed <= mizu_zc_gc_bytes) return;
+  mizu_zc_armed = 0;
+  /* the top-level context contains the eval (finalizers included: each
+     rides its own top-level context and cannot unwind into this frame) */
+  R_ToplevelExec(mizu_zc_gc_run, NULL);
+}
+
+// Consumer open: split mapping ---------------------------------------------------
+
+/* The core's flags-form view open: page 0 read-write (the refcount word
+   needs it), remaining pages read-only, lazy everywhere — a view is touched
+   on demand, so eager PTE install would prefault never-read pages on the
+   recv hot path (the SHM_RAW cache's populated open exists because a
+   stream is unserialized in full immediately; a view is not). NOCOUNT:
+   an ALTREP wrap can longjmp between map and count, so the counted add
+   lands at the wrap (before the consumer-done signal), not here.
+   Two call paths: registered as the view layer's embedder open hook
+   (mizu_zc_init) — the wire-resolve cache's misses — and called directly by
+   the prep path below (the per-handle cache). */
+mizu_shm *mizu_zc_open(const char *name) {
+  mizu_shm *shm;
+  if (mizu_shm_open_view_flags(&shm, name, MIZU_OPEN_VIEW_NOCOUNT) != MIZU_OK)
+    return NULL;
+  return shm;
+}
+
+// Eligibility --------------------------------------------------------------------
+
+/* Lower bound on the MIZS layout size (header + the string block's fixed
+   sections + packed string bytes; attrs excluded): 64 + the geometry's
+   data offset + the CHARSXP bytes. Walks string lengths only — no
+   allocation, no serialize count. The budget caps the walk: exact while
+   the running sum stays within it, a partial sum past it — the only
+   consumers are gate comparisons, and the fixed sections alone clear a
+   zero budget, so no caller needs the walk it skips. */
+static size_t mizu_zc_str_probe_budget(SEXP x, size_t budget) {
+  R_xlen_t n = XLENGTH(x);
+  const SEXP *base = mizu_view_str_base(x);
+  size_t total = MIZU_HEADER_SIZE + mizu_view_str_geometry((size_t) n).data;
+  for (R_xlen_t i = 0; i < n && total <= budget; i++) {
+    SEXP s = mizu_view_str_elt(x, i, base);
+    if (s != NA_STRING) total += (size_t) LENGTH(s);
+  }
+  return total;
+}
+
+static size_t mizu_zc_str_probe(SEXP x) {
+  return mizu_zc_str_probe_budget(x, SIZE_MAX);
+}
+
+/* The string-leaf body sums an eligibility walk has already measured,
+   handed to mizu_view_layout_size_sums so the size pass's string walks
+   retire (the foreign walks are verdict-bound — they visit every string
+   element regardless — so recording is free there; the same-language
+   probe keeps its budget cap and records nothing). exact goes 0 on any
+   leaf the size pass would walk but the walk didn't measure — a lazy
+   ALTREP container or string leaf the probe skips, or the buffer
+   filling — and the caller falls back to the plain size pass. */
+#define MIZU_ZC_SUMS_MAX 128
+typedef struct {
+  size_t v[MIZU_ZC_SUMS_MAX];
+  size_t n;
+  int exact;
+} mizu_zc_sums;
+
+static void mizu_zc_sums_record(mizu_zc_sums *sums, size_t body) {
+  if (sums->n == MIZU_ZC_SUMS_MAX) {
+    sums->exact = 0;
+    return;
+  }
+  sums->v[sums->n++] = body;
+}
+
+/* Lower bound on the MIZL layout size: layout-eligible leaf bytes only
+   (headers, directory, attrs, and serialized leaves all excluded), so the
+   exact mizu_view_layout_size always exceeds it. A mizu view anywhere in the
+   tree rejects it outright: nested views must cross by reference on the
+   serialize-hook path (the wire hooks keep them counted) — the layout
+   writer would copy their bytes, and a copied view can never be REF'd
+   back. Foreign ALTREP leaves failing mizu_view_altrep_readable cost 0 here;
+   the oracle rejects the tree later. Serialized leaves cost 0 too,
+   so a tree whose bulk is
+   non-eligible (a big environment, a call) stays on the serialize tiers —
+   MIZL's win is the eligible leaves.
+   The return feeds only a `<= gate` comparison, so the budget (seeded
+   with that gate) caps it: exact while the tree's sum stays within
+   budget, a partial sum once it clears — both sides of the boundary
+   exact. The cap shortens string-leaf walks only; every node is still
+   visited, so a non-REF-able view past the clearing point rejects as the
+   uncapped walk did. */
+static size_t mizu_zc_tree_probe(SEXP x, size_t budget, int *reject) {
+  R_CheckStack();   /* deep trees must raise here, not segfault below */
+  if (*reject) return 0;
+  if (ALTREP(x)) {
+    if (mizu_view_check(x)) {
+      /* a REF-able view element crosses as a remote leaf (F2.5): the
+         identifier span. A materialized, locally attributed or broken-
+         identifier view keeps rejecting — the serialize path's wire
+         hooks carry those, by reference or by value as before. */
+      if (mizu_view_refable(x)) {
+        SEXP id = PROTECT(mizu_view_remote_id(x));
+        if (id != R_NilValue) {
+          const size_t span = (size_t) LENGTH(STRING_ELT(id, 0));
+          UNPROTECT(1);
+          return span;
+        }
+        /* a broken identifier or one past the readers' span cap: the tree
+           falls back to the serialize tiers, the wire hooks carrying the
+           view by reference as before */
+        UNPROTECT(1);
+      }
+      *reject = 1;
+      return 0;
+    }
+    if (!mizu_view_altrep_readable(x)) return 0;  /* lazy: the oracle vetoes */
+  }
+  int type = TYPEOF(x);
+  size_t elt = mizu_view_sizeof_elt(type);
+  if (elt != 0) return (size_t) XLENGTH(x) * elt;
+  if (type == STRSXP) return mizu_zc_str_probe_budget(x, budget);
+  if (type == VECSXP) {
+    R_xlen_t n = XLENGTH(x);
+    size_t total = 0;
+    for (R_xlen_t i = 0; i < n && !*reject; i++)
+      total += mizu_zc_tree_probe(VECTOR_ELT(x, i),
+                                  total < budget ? budget - total : 0,
+                                  reject);
+    return total;
+  }
+  if (type == LISTSXP) {
+    size_t total = 0;
+    for (SEXP s = x; s != R_NilValue && !*reject; s = CDR(s))
+      total += mizu_zc_tree_probe(CAR(s),
+                                  total < budget ? budget - total : 0,
+                                  reject);
+    return total;
+  }
+  return 0;
+}
+
+/* SHM_VEC eligibility: an object the view layouts cover whose layout
+   bytes exceed both the inline budget and MIZU_ZC_FLOOR. Atomic vectors
+   gate on the O(1) data size (a lazy ALTREP input must never stage:
+   staging grabs DATAPTR and materializes it — 1:1e8 would become an
+   800 MB memcpy against the ~100-byte stream its serialized-state hook
+   emits. The mizu_view_altrep_readable probe admits directly readable,
+   keeper-free data without materializing: R's S4 data-part wrappers
+   forward to their data part).
+   Strings and list trees have no O(1) size, and mizu_view_layout_size's walk
+   serialize-counts non-eligible leaves — a per-send tax the pool's small
+   task payloads must not pay — so a cheap lower-bound probe gates the
+   exact walk, which then doubles as region size and oracle (0 rejects
+   foreign ALTREP nodes). Top-level LISTSXP stays on the serialize
+   tiers: the layout coerces it to VECSXP, a type change a transport must
+   not make. */
+int mizu_zc_eligible(SEXP x, uint32_t inline_max, size_t *out_total,
+                     int foreign) {
+  int type = TYPEOF(x);
+  size_t elt = mizu_view_sizeof_elt(type);
+  if (elt != 0) {
+    if (!foreign && ALTREP(x) && !mizu_view_altrep_readable(x)) return 0;
+    size_t data = (size_t) XLENGTH(x) * elt;
+    if (data <= (size_t) inline_max || data < MIZU_ZC_FLOOR) return 0;
+    size_t total = mizu_view_layout_size(x, foreign);
+    if (total == 0 || total <= (size_t) inline_max) return 0;
+    *out_total = total;
+    return 1;
+  }
+  size_t gate = mizu_zc_gate(inline_max);
+  if (type == STRSXP) {
+    /* a foreign ALTREP string's Elt may materialize it — the probe must
+       not touch it (a mizu view is safe: its accessors read the shared
+       pages or the materialized copy). The mizu_view_altrep_readable probe
+       admits directly readable, keeper-free data (R's S4 data-part
+       wrappers) without touching elements. */
+    if (ALTREP(x) && !mizu_view_check(x) && !mizu_view_altrep_readable(x))
+      return 0;
+    const size_t probe = mizu_zc_str_probe(x);
+    if (probe <= gate) return 0;
+    if (!ANY_ATTRIB(x)) {
+      /* the probe's sum is the exact layout size here: header + geometry +
+         packed bytes is mizs_size with zero attrs, and the writer's
+         return — the size walk adds nothing */
+      *out_total = probe;
+      return 1;
+    }
+  } else if (type == VECSXP) {
+    int reject = 0;
+    if (mizu_zc_tree_probe(x, gate, &reject) <= gate || reject) return 0;
+  } else {
+    return 0;
+  }
+  size_t total = mizu_view_layout_size(x, foreign);
+  if (total == 0) return 0;
+  *out_total = total;
+  return 1;
+}
+
+// The foreign zero-copy gate ---------------------------------------------------------
+
+/* The generic-tree half of the filter, fused with the floor-gate probe:
+   every leaf an attribute-free atomic, a class-only integer64, a string
+   vector (MIZS-gated), a plain factor (ATTRS-gated), or such a tree;
+   names under the dict-key rules (ATTRS-gated); a serialized leaf or a
+   nested view rejects the tree (the interop writer takes it as a copy,
+   or declines it at send). Verdict before sum per leaf — a caps
+   rejection never pays a size walk — and the string verdict's walk
+   doubles as the probe's byte sum, so the tree is walked once where the
+   separate caps walk and probe walked it twice. Returns the probe sum
+   (unbudgeted: the verdict walks every string element regardless);
+   *reject carries the verdict, mizu_zc_tree_probe's view policy
+   preserved: a view passed by a whitelist shape rejects as the probe
+   did, and a lazy ALTREP costs 0 (the write copies it through
+   *_GET_REGION). The string leaves' body sums are recorded in pre-order
+   for the presized size pass — the verdict walk measured every one, a
+   lazy ALTREP string leaf's true bytes included. */
+static size_t mizu_zc_tree_walk_fx(SEXP x, uint32_t caps, int *reject,
+                                   mizu_zc_sums *sums) {
+  R_CheckStack();   /* deep trees must raise here, not segfault below */
+  if (*reject) return 0;
+  switch (TYPEOF(x)) {
+  case LGLSXP: case INTSXP: case REALSXP: case CPLXSXP: case RAWSXP:
+    if (!ANY_ATTRIB(x)) {
+      if (mizu_view_check(x)) { *reject = 1; return 0; }
+    } else if (!mizu_view_is_int64(x)) {
+      if (!(caps & MIZU_CAP_ATTRS)) { *reject = 1; return 0; }
+      /* the whitelisted leaf shapes a region-backed reader homes:
+         factor, dim, Date, POSIXct, difftime (the 'I' leaf blob
+         carries them), and the labeled shapes when the peer's mask
+         carries MIZU_CAP_LABELED — the verdict's own caps word decides */
+      const int q = mizu_interop_attrs_qualify(x);
+      const uint32_t need = ix_q_caps(q);
+      if (need == 0 || (caps & need) != need) { *reject = 1; return 0; }
+    }
+    if (ALTREP(x)) {
+      if (mizu_view_check(x)) { *reject = 1; return 0; }
+      if (!mizu_view_altrep_readable(x)) return 0;
+    }
+    return (size_t) XLENGTH(x) * mizu_view_sizeof_elt(TYPEOF(x));
+  case STRSXP: {
+    /* a view leaf keeps rejecting on generic trees (remote leaves are the
+       frame gate's, F2.5) */
+    if (ANY_ATTRIB(x) || mizu_view_check(x) || !(caps & MIZU_CAP_MIZS)) {
+      *reject = 1;
+      return 0;
+    }
+    size_t bytes = 0;
+    if (!mizu_interop_strings_utf8(x, &bytes)) { *reject = 1; return 0; }
+    const size_t body = mizu_view_str_geometry((size_t) XLENGTH(x)).data +
+      bytes;
+    mizu_zc_sums_record(sums, body);
+    if (ALTREP(x) && !mizu_view_altrep_readable(x)) return 0;
+    return MIZU_HEADER_SIZE + body;
+  }
+  case VECSXP: {
+    if (Rf_isS4(x) || mizu_view_check(x)) { *reject = 1; return 0; }
+    SEXP names = PROTECT(Rf_getAttrib(x, R_NamesSymbol));
+    if (names != R_NilValue &&
+        (!(caps & MIZU_CAP_ATTRS) || TYPEOF(names) != STRSXP ||
+         !mizu_interop_names_ok(names))) {
+      UNPROTECT(1);
+      *reject = 1;
+      return 0;
+    }
+    /* a lazy ALTREP node costs the probe 0, but the caps walk still
+       verdicts its descendants (a latin1 string under one rejects the
+       tree); the size pass walks them too, so the recording stands */
+    if (ALTREP(x) && !mizu_view_altrep_readable(x)) {
+      for (R_xlen_t i = 0; !*reject && i < XLENGTH(x); i++)
+        mizu_zc_tree_walk_fx(VECTOR_ELT(x, i), caps, reject, sums);
+      UNPROTECT(1);
+      return 0;
+    }
+    size_t total = 0;
+    for (R_xlen_t i = 0; !*reject && i < XLENGTH(x); i++)
+      total += mizu_zc_tree_walk_fx(VECTOR_ELT(x, i), caps, reject, sums);
+    UNPROTECT(1);
+    return total;
+  }
+  default:
+    *reject = 1;
+    return 0;
+  }
+}
+
+
+/* The foreign-handle SHM_VEC filter: a reader is never sent a layout it
+   cannot wrap (its identity word's capability mask is the sender's
+   contract), so a value past the floor outside the peer's set takes the
+   interop writer as a copy instead of failing one hop late at receive.
+   The baseline needs no bit: an attribute-free MIZH atomic — ALTREP
+   admitted here, unlike the same-language gate, the layout write copying
+   through *_GET_REGION — or a class-only integer64. */
+int mizu_zc_eligible_foreign(SEXP x, uint32_t inline_max, size_t *out_total,
+                             uint32_t caps) {
+  const int type = TYPEOF(x);
+  const size_t elt = mizu_view_sizeof_elt(type);
+  if (elt != 0) {
+    if (Rf_isS4(x)) return 0;
+    if (!ANY_ATTRIB(x) || mizu_view_is_int64_any(x)) {
+      /* the baseline MIZH, any representation — the layout write's
+         foreign mode adds the validity reserve, so size it there */
+      size_t data = (size_t) XLENGTH(x) * elt;
+      if (data <= (size_t) inline_max || data < MIZU_ZC_FLOOR) return 0;
+      size_t total = mizu_view_layout_size(x, 1);
+      if (total <= (size_t) inline_max) return 0;
+      *out_total = total;
+      return 1;
+    }
+    /* an attributed MIZH root: the whitelisted shapes, the verdict's
+       own caps word the gate (ATTRS for the baseline, + LABELED for the
+       labeled shapes) */
+    const int q = mizu_interop_attrs_qualify(x);
+    const uint32_t need = ix_q_caps(q);
+    if (need == 0 || (caps & need) != need) return 0;
+    return mizu_zc_eligible(x, inline_max, out_total, 1);
+  }
+  if (type == STRSXP) {
+    /* S4 declines here as on every other foreign path (the interop
+       writer raises the loud decline): a staged SHM_VEC would stamp the
+       S4 flag and a foreign reader would wrap a plain string vector — a
+       silent class downgrade */
+    if (Rf_isS4(x)) return 0;
+    /* MIZS, gated on the bit and every element crossing as UTF-8 (a
+       latin1 vector takes the 'I' copy, which translates it; a
+       bytes-marked one declines there). The fence runs ahead of any
+       walk; the gate walk then doubles as the probe's byte sum, and for
+       an attribute-free vector that sum is the exact layout size. */
+    if (!(caps & MIZU_CAP_MIZS)) return 0;
+    if (ALTREP(x) && !mizu_view_check(x) && !mizu_view_altrep_readable(x))
+      return 0;
+    size_t bytes = 0;
+    if (!mizu_interop_strings_utf8(x, &bytes)) return 0;
+    const size_t gate = mizu_zc_gate(inline_max);
+    const size_t total = MIZU_HEADER_SIZE +
+      mizu_view_str_geometry((size_t) XLENGTH(x)).data + bytes;
+    if (total <= gate) return 0;
+    if (!ANY_ATTRIB(x)) {
+      *out_total = total;
+      return 1;
+    }
+    const size_t exact = mizu_view_layout_size(x, 1);
+    if (exact == 0) return 0;
+    *out_total = exact;
+    return 1;
+  }
+  if (type != VECSXP) return 0;
+  /* a data.frame: ATTRS + MIZL (plus LABELED for the extended form),
+     plus MIZS when any column is a string; a generic tree: MIZL, plus
+     MIZS for a string leaf and ATTRS for the names blob or a factor
+     leaf — a peer short of any one bit gets the whole value as an attr
+     copy */
+  const int q = mizu_interop_attrs_qualify(x);
+  if (q == MIZU_IXQ_FRAME || q == MIZU_IXQ_FRAME_EXT) {
+    uint32_t need = MIZU_CAP_ATTRS | MIZU_CAP_MIZL |
+      (q == MIZU_IXQ_FRAME_EXT ? MIZU_CAP_LABELED : 0);
+    int has_ref = 0;
+    for (R_xlen_t i = 0; i < XLENGTH(x); i++) {
+      SEXP col = VECTOR_ELT(x, i);
+      if (TYPEOF(col) == STRSXP) need |= MIZU_CAP_MIZS;
+      /* an ordered factor column's bit (the verdict is the stage's own —
+         cached): the blob writer has no caps word, the filter is it */
+      if (mizu_interop_attrs_qualify(col) == MIZU_IXQ_ORDERED)
+        need |= MIZU_CAP_ORDERED;
+      if (!has_ref && mizu_view_refable(col)) has_ref = 1;
+    }
+    /* a view column crosses as a remote leaf (F2.5): the conditional
+       conjunction — a peer short of the bit keeps the rejection (the
+       whole frame takes the 'I' copy) */
+    if (has_ref) need |= MIZU_CAP_MIZL_REF;
+    if ((caps & need) != need) return 0;
+    /* the root probe the tail call ran, inlined: a frame that is itself
+       a view (a REF-able one's span never clears the gate) or a lazy
+       ALTREP declines there */
+    if (ALTREP(x) &&
+        (mizu_view_check(x) || !mizu_view_altrep_readable(x)))
+      return 0;
+    /* one pass over the columns, the string-column gate fused with the
+       floor-gate probe: a string column gates like a top-level vector
+       (a latin1 column takes the 'I' copy, which translates it; a
+       bytes-marked one declines there — ungated it would reach the
+       reader one hop late), its verdict walk doubling as the probe's
+       byte sum. A REF-able view column crosses by reference and is
+       never walked; a non-REF-able view rejects through the probe, as
+       does one nested in a list column. Verdict before sum per column,
+       and every column visited: a late verdict decides as the early
+       one did. */
+    const size_t gate = mizu_zc_gate(inline_max);
+    size_t total = 0;
+    int reject = 0;
+    mizu_zc_sums sums = { .n = 0, .exact = 1 };
+    for (R_xlen_t i = 0; i < XLENGTH(x) && !reject; i++) {
+      SEXP col = VECTOR_ELT(x, i);
+      if (TYPEOF(col) == STRSXP && !mizu_view_refable(col)) {
+        if (mizu_view_check(col)) { reject = 1; break; }
+        size_t bytes = 0;
+        if (!mizu_interop_strings_utf8(col, &bytes)) return 0;
+        const size_t body =
+          mizu_view_str_geometry((size_t) XLENGTH(col)).data + bytes;
+        mizu_zc_sums_record(&sums, body);
+        if (!(ALTREP(col) && !mizu_view_altrep_readable(col)))
+          total += MIZU_HEADER_SIZE + body;
+      } else {
+        /* ix_qualify_frame admits atomic and string columns only: the
+           probe here never meets a string leaf, so nothing records */
+        total += mizu_zc_tree_probe(col, total < gate ? gate - total : 0,
+                                    &reject);
+      }
+    }
+    if (reject || total <= gate) return 0;
+    total = 0;
+    if (sums.exact)
+      total = mizu_view_layout_size_sums(x, 1, sums.v, sums.n);
+    if (total == 0)
+      total = mizu_view_layout_size(x, 1);
+    if (total == 0) return 0;
+    *out_total = total;
+    return 1;
+  }
+  if (!(caps & MIZU_CAP_MIZL)) return 0;
+  const size_t gate = mizu_zc_gate(inline_max);
+  int reject = 0;
+  mizu_zc_sums sums = { .n = 0, .exact = 1 };
+  if (mizu_zc_tree_walk_fx(x, caps, &reject, &sums) <= gate || reject)
+    return 0;
+  size_t total = 0;
+  if (sums.exact)
+    total = mizu_view_layout_size_sums(x, 1, sums.v, sums.n);
+  if (total == 0)
+    total = mizu_view_layout_size(x, 1);
+  if (total == 0) return 0;
+  *out_total = total;
+  return 1;
+}
+
+/* The REF half of the filter: a view re-sent top-level crosses by
+   reference only when the peer wraps its layout (the claim marks the
+   region REFHELD, so the filter runs ahead of mizu_zc_ref_stage). */
+int mizu_zc_ref_foreign_ok(SEXP x, uint32_t caps) {
+  if (!mizu_view_check(x)) return 1;   /* not a view: REF never claims it */
+  switch (TYPEOF(x)) {
+  case LGLSXP: case INTSXP: case REALSXP: case CPLXSXP: case RAWSXP:
+    if (!ANY_ATTRIB(x) || mizu_view_is_int64_any(x)) return 1;
+    return (caps & MIZU_CAP_ATTRS) != 0;
+  case STRSXP: {
+    const uint32_t need = ANY_ATTRIB(x) ?
+      MIZU_CAP_MIZS | MIZU_CAP_ATTRS : MIZU_CAP_MIZS;
+    return (caps & need) == need;
+  }
+  default: {
+    const uint32_t need = ANY_ATTRIB(x) ?
+      MIZU_CAP_MIZL | MIZU_CAP_ATTRS : MIZU_CAP_MIZL;
+    return (caps & need) == need;
+  }
+  }
+}
+
+// Stage ----------------------------------------------------------------------------
+
+/* Stage x as SHM_VEC: one layout write into a spill region (free-list pop
+   or fresh create — the irreducible producer-writes-once floor), refcount
+   store 1 (the producer's loan — both the field's only initialization and
+   its own reference; a recycled region carries a stale count), and the
+   name as the payload. Fills the retain entry: the region, the pin of x,
+   and the consumer key cell (-1) the release point may re-stamp. ctx is
+   the stage hook's binding ctx. foreign is the peer-language signal: the
+   layout write builds the validity-bitmap section (mizu.h's [40-55]
+   header words) and aux carries the write's actual total — the size
+   pass's reservation counts clean leaves' unspent bitmap bytes. */
+void mizu_zc_stage(mizu_slot_hdr *hdr, unsigned char *payload, SEXP x,
+                  size_t total, mizu_handle *h, void *ctx, int foreign) {
+  mizu_shm *shm = mizu_spill_get_raise(h, (size_t) total);
+  size_t used =
+    mizu_view_layout_write((unsigned char *) shm->addr, x, foreign);
+  /* the aux code must match the layout's root sexptype: class-only
+     integer64 stamped its MIZH root MIZU_VIEW_TYPE_INT64 */
+  int type = mizu_view_is_int64_any(x) ? MIZU_TYPE_INT64 : (int) TYPEOF(x);
+  hdr->kind = MIZU_KIND_SHM_VEC;
+  hdr->len = (uint32_t) shm->name_len;
+  hdr->aux = mizu_aux_shm_vec(type == LISTSXP ? VECSXP : type,
+                             (uint64_t) used);
+  memcpy(payload, shm->name, shm->name_len);
+  mizu_r_pin(h, ctx, x);
+  /* the producer-loan refcount store (rc = 1, flags = 0) rides the retain */
+  mizu_stage_retain_zc(h, shm);
+}
+
+// Receive ---------------------------------------------------------------------------
+
+// The view cache (name -> split mapping, wrap-pinned) -------------------------
+
+/* The name-keyed lookup: the wrap SEXP on a hit (stamp bumped), R_NilValue
+   on a miss or a finalized entry (the caller re-opens and re-stores).
+   Eviction only ever drops the reference — a live view keeps its mapping
+   through its own chain. */
+SEXP mizu_zc_lookup_wrap(mizu_zc_cache *oc, const unsigned char *name,
+                        uint32_t len) {
+  for (int i = 0; i < MIZU_OPEN_CACHE_MAX; i++)
+    if (oc->name_len[i] == len &&
+        memcmp(oc->names[i], name, len) == 0) {
+      SEXP wrap = VECTOR_ELT(oc->wraps, i);
+      if (mizu_shm_unwrap(wrap) == NULL) return R_NilValue;  /* finalized */
+      oc->stamp[i] = ++oc->tick;
+      oc->hits++;
+      return wrap;
+    }
+  return R_NilValue;
+}
+
+void mizu_zc_cache_store(mizu_zc_cache *oc, const unsigned char *name,
+                        uint32_t len, SEXP wrap) {
+  int slot = 0;
+  for (int i = 0; i < MIZU_OPEN_CACHE_MAX; i++) {
+    if (oc->name_len[i] == 0) {
+      slot = i;
+      break;
+    }
+    if (oc->stamp[i] < oc->stamp[slot]) slot = i;
+  }
+  SET_VECTOR_ELT(oc->wraps, slot, wrap);   /* evicted LRU drops to GC */
+  memcpy(oc->names[slot], name, len);
+  oc->name_len[slot] = (uint8_t) len;
+  oc->stamp[slot] = ++oc->tick;
+  oc->misses++;
+}
+
+/* Open the named region's split mapping (cache first) and build the view
+   chain anchor: rel_xp (the release record, unarmed) pinned through
+   name_xp (the vendored chain-terminus tag) pinned on the mapping wrap.
+   Returns name_xp UNPROTECTED — the caller PROTECTs before any allocation
+   (nothing allocates between); rel_xp and the mapping wrap ride its prot
+   chain. R_NilValue with *gone set when the region vanished and the
+   caller absorbs that (NULL gone raises instead). */
+static SEXP mizu_zc_prep(const char *name, uint32_t name_len, int *gone,
+                         mizu_zc_cache *oc, mizu_shm **shm_out) {
+  SEXP map_wrap = oc != NULL ?
+    mizu_zc_lookup_wrap(oc, (const unsigned char *) name, name_len) :
+    R_NilValue;
+  mizu_shm *shm = map_wrap == R_NilValue ? NULL : mizu_shm_unwrap(map_wrap);
+  if (shm == NULL) {
+    char namebuf[MIZU_NAME_MAX];
+    memcpy(namebuf, name, name_len);
+    namebuf[name_len] = '\0';
+    shm = mizu_zc_open(namebuf);
+    if (shm == NULL) {
+      if (gone != NULL) {
+        *gone = 1;
+        return R_NilValue;
+      }
+      mizu_stop_shm(NA_REAL, "mizu: cannot open payload region '%s'", namebuf);
+    }
+    map_wrap = mizu_shm_wrap_consumer(shm);
+    if (oc != NULL)
+      mizu_zc_cache_store(oc, (const unsigned char *) name, name_len, map_wrap);
+  }
+  PROTECT(map_wrap);             /* cached or fresh: one constant pin */
+  mizu_zc_rel *rel = malloc(sizeof(mizu_zc_rel));
+  if (rel == NULL) {
+    UNPROTECT(1);
+    Rf_error("mizu: allocation failure");
+  }
+  rel->shm = shm;
+  rel->pid = mizu_self_pid();
+  rel->armed = 0;
+  rel->loans = NULL;
+  rel->nloans = 0;
+  rel->loans_cap = 0;
+  SEXP rel_xp = PROTECT(R_MakeExternalPtr(rel, mizu_rel_tag, map_wrap));
+  R_RegisterCFinalizerEx(rel_xp, mizu_rel_finalizer, TRUE);
+  /* the vendored chain walk (identifier formatting) ends at the first
+     shm-tag hop reading it as a mizu_shm — name_xp borrows the mapping's */
+  SEXP name_xp = PROTECT(R_MakeExternalPtr(shm, mizu_shm_tag_sym, rel_xp));
+  *shm_out = shm;
+  UNPROTECT(3);
+  return name_xp;
+}
+
+/* Validate the layout at the region base and wrap it as a view, the
+   release hook riding the view's owned metadata. aux != 0 (the SHM_VEC
+   wire form) cross-checks the staged type and exact byte count against
+   the header. The refcount add is the caller's — it lands after the wrap,
+   before the consumer-done signal. */
+static SEXP mizu_zc_wrap0(mizu_shm *shm, SEXP name_xp, SEXP rel_xp,
+                         uint64_t aux) {
+  unsigned char *base = (unsigned char *) shm->addr;
+  int64_t region_size = (int64_t) shm->size;
+  if (region_size < (int64_t) MIZU_HEADER_SIZE)
+    Rf_error("mizu: corrupt payload slot");
+  uint32_t magic;
+  memcpy(&magic, base, 4);
+  switch (magic) {
+  case MIZU_MAGIC_VEC: {
+    int32_t type;
+    int64_t length, attrs_size;
+    memcpy(&type, base + 4, 4);
+    memcpy(&length, base + 8, 8);
+    memcpy(&attrs_size, base + 16, 8);
+    size_t elt = mizu_view_sizeof_elt(type);
+    if (elt == 0 || length < 0 || attrs_size < 0 ||
+        length > (region_size - (int64_t) MIZU_HEADER_SIZE) / (int64_t) elt ||
+        attrs_size >
+          region_size - (int64_t) MIZU_HEADER_SIZE - length * (int64_t) elt ||
+        !mizu_view_flags_known(base))
+      Rf_error("mizu: corrupt payload slot");
+    /* the three-state validity pair (mizu.h): {0, 0} absent, {0, -1}
+       known-NA-free, or a 64-aligned offset whose bitmap fits the region
+       — the R view never reads the section; a foreign writer's carries
+       the exact-extent term below */
+    int64_t voff, vcount;
+    memcpy(&voff, base + MIZU_HDR_VALID_OFF, 8);
+    memcpy(&vcount, base + MIZU_HDR_VALID_COUNT, 8);
+    if (voff == 0) {
+      if (vcount != 0 && vcount != -1) Rf_error("mizu: corrupt payload slot");
+    } else if ((voff & 63) != 0 || vcount < 0 || vcount > length ||
+               voff > region_size ||
+               (uint64_t) ((length + 7) / 8) > (uint64_t) (region_size - voff))
+      Rf_error("mizu: corrupt payload slot");
+    if (aux != 0) {
+      uint64_t extent = (uint64_t) voff > 0 ?
+        (uint64_t) voff + ((uint64_t) length + 7) / 8 :
+        (uint64_t) ((size_t) MIZU_HEADER_SIZE + (size_t) length * elt +
+                    (size_t) attrs_size);
+      if ((uint32_t) mizu_aux_type(aux) != (uint32_t) type ||
+          mizu_aux_hi(aux) != extent)
+        Rf_error("mizu: corrupt payload slot");
+    }
+    SEXP view = PROTECT(mizu_view_vec_wrap(base + MIZU_HEADER_SIZE,
+                                      (R_xlen_t) length, type, name_xp,
+                                      mizu_zc_rel_fire, rel_xp));
+    view = mizu_view_restore_tail(view, base + MIZU_HEADER_SIZE +
+                                  (size_t) length * elt,
+                                  (size_t) attrs_size, base);
+    UNPROTECT(1);
+    return view;
+  }
+  case MIZU_MAGIC_STR: {
+    int32_t attrs_size;
+    int64_t n, str_size;
+    memcpy(&attrs_size, base + 4, 4);
+    memcpy(&n, base + 8, 8);
+    memcpy(&str_size, base + 16, 8);
+    if (n < 0 || str_size < 0 || attrs_size < 0 ||
+        str_size > region_size - (int64_t) MIZU_HEADER_SIZE ||
+        attrs_size > region_size - (int64_t) MIZU_HEADER_SIZE - str_size ||
+        !mizu_view_flags_known(base))
+      Rf_error("mizu: corrupt payload slot");
+    if (aux != 0 &&
+        ((uint32_t) mizu_aux_type(aux) != (uint32_t) STRSXP ||
+         mizu_aux_hi(aux) != (uint64_t) ((size_t) MIZU_HEADER_SIZE +
+                                        (size_t) str_size +
+                                        (size_t) attrs_size)))
+      Rf_error("mizu: corrupt payload slot");
+    SEXP view = PROTECT(mizu_view_str_wrap(base + MIZU_HEADER_SIZE, (R_xlen_t) n,
+                                      str_size, name_xp, mizu_zc_rel_fire,
+                                      rel_xp));
+    view = mizu_view_restore_tail(view, base + MIZU_HEADER_SIZE +
+                                  (size_t) str_size, (size_t) attrs_size,
+                                  base);
+    UNPROTECT(1);
+    return view;
+  }
+  case MIZU_MAGIC_LIST: {
+    /* the list wrap validates the header and directory internally; the
+       layout size isn't header-derivable, so aux cross-checks the type */
+    if (aux != 0 && (uint32_t) mizu_aux_type(aux) != (uint32_t) VECSXP)
+      Rf_error("mizu: corrupt payload slot");
+    SEXP view = PROTECT(mizu_view_list_wrap(base, region_size, -1, name_xp,
+                                       mizu_zc_rel_fire, rel_xp));
+    /* remote leaves would count at lazy first access — after the
+       consumer-done signal: hold every referenced region with the root's
+       record from the wrap */
+    mizu_zc_mizl_loans(base, region_size,
+                       (mizu_zc_rel *) R_ExternalPtrAddr(rel_xp));
+    UNPROTECT(1);
+    return view;
+  }
+  }
+  Rf_error("mizu: corrupt payload slot");
+}
+
+SEXP mizu_zc_read(const mizu_slot_hdr *hdr, const unsigned char *payload,
+                 int *gone, mizu_zc_cache *oc) {
+  /* one read: the slot is peer-writable, so the bound and the name copy
+     (mizu_zc_prep's fixed buffer) must be one snapshot */
+  const uint32_t len = hdr->len;
+  if (len == 0 || len >= MIZU_NAME_MAX)
+    Rf_error("mizu: corrupt payload slot");
+  mizu_shm *shm = NULL;
+  SEXP name_xp = mizu_zc_prep((const char *) payload, len, gone, oc,
+                              &shm);
+  if (name_xp == R_NilValue) return R_NilValue;
+  PROTECT(name_xp);
+  SEXP rel_xp = PROTECT(R_ExternalPtrProtected(name_xp));
+  SEXP view = PROTECT(mizu_zc_wrap0(shm, name_xp, rel_xp, hdr->aux));
+  mizu_zc_ref(shm);
+  mizu_zc_rel_arm((mizu_zc_rel *) R_ExternalPtrAddr(rel_xp), shm);
+  UNPROTECT(3);
+  return view;
+}
+
+// REF -----------------------------------------------------------------------------
+
+/* The region behind a view: walk data1's protected chain to the shm-tag
+   terminus and read its mizu_shm (mizu's name_xp and the vendored wraps
+   both terminate there). R_NilValue for anything else. */
+static SEXP mizu_view_terminus(SEXP x) {
+  SEXP hop = R_ExternalPtrProtected(R_altrep_data1(x));
+  while (TYPEOF(hop) == EXTPTRSXP) {
+    if (R_ExternalPtrTag(hop) == mizu_shm_tag_sym) return hop;
+    hop = R_ExternalPtrProtected(hop);
+  }
+  return R_NilValue;
+}
+
+/* Mark a view's region REFHELD (the holder set widens beyond the direct
+   peer, so the producer's death backstop must leak + unlink rather than
+   force-reclaim) and record the view on the mark list — the funnel every
+   by-reference emission (the REF tier's claim below, the serialize
+   fallback's wire hooks, the 'I' ref gate) goes through. Every mizu
+   consumer mapping has a writable page 0 — the prep path's split open
+   and the vendored cache's hook open alike — so the flag store goes
+   straight through the chain terminus. */
+void mizu_zc_ref_mark(SEXP x) {
+  zc_list_push(&mizu_zc_nmarks, x);
+  SEXP terminus = mizu_view_terminus(x);
+  if (terminus == R_NilValue) return;
+  mizu_shm *shm = (mizu_shm *) R_ExternalPtrAddr(terminus);
+  if (shm == NULL || shm->addr == NULL) return;
+  atomic_fetch_or_explicit(mizu_zc_flags_(shm->addr), MIZU_ZC_FLAG_REFHELD,
+                           memory_order_acq_rel);
+}
+
+int mizu_zc_ref_stage(mizu_slot_hdr *hdr, unsigned char *payload,
+                     uint32_t inline_max, SEXP x) {
+  if (!mizu_view_check(x)) return 0;
+  /* data2 set on a vector or string view means COW-materialized: the
+     release already fired (the region may be recycled) and the private
+     copy may hold mutations — such a view must cross by value. A list
+     view's data2 is only the element cache: reads never detach it (the
+     release fires at the finalizer), so list views REF at any time. */
+  if (TYPEOF(x) != VECSXP && R_altrep_data2(x) != R_NilValue) return 0;
+  SEXP id = PROTECT(mizu_view_shm_name(x));
+  if (id == R_NilValue) {
+    UNPROTECT(1);
+    return 0;
+  }
+  const char *s = CHAR(STRING_ELT(id, 0));
+  size_t len = strlen(s);
+  /* a locally re-attributed view crosses by value: the REF resolves the
+     region's attributes and would silently drop the local edit */
+  if (len == 0 || len > (size_t) inline_max ||
+      !mizu_view_attrs_match(x, id)) {
+    UNPROTECT(1);
+    return 0;
+  }
+  hdr->kind = MIZU_KIND_REF;
+  hdr->len = (uint32_t) len;
+  hdr->aux = 0;
+  memcpy(payload, s, len);
+  mizu_zc_ref_mark(x);
+  UNPROTECT(1);
+  return 1;
+}
+
+SEXP mizu_zc_ref_read(const mizu_slot_hdr *hdr, const unsigned char *payload,
+                     int *gone, mizu_zc_cache *oc) {
+  /* one read: the slot is peer-writable, so the bound and the stack
+     copy must be one snapshot */
+  const uint32_t len = hdr->len;
+  if (len == 0 || len >= MIZU_VIEW_IDENTIFIER_MAX)
+    Rf_error("mizu: corrupt payload slot");
+  char buf[MIZU_VIEW_IDENTIFIER_MAX];
+  memcpy(buf, payload, len);
+  buf[len] = '\0';
+  char name[MIZU_NAME_MAX];
+  int32_t path[MIZU_VIEW_MAX_PATH];
+  int path_len = 0;
+  if (mizu_view_parse_id(buf, name, sizeof(name), path, &path_len) < 0)
+    Rf_error("mizu: corrupt payload slot");
+  mizu_shm *shm = NULL;
+  SEXP name_xp = mizu_zc_prep(name, (uint32_t) strlen(name), gone, oc,
+                              &shm);
+  if (name_xp == R_NilValue) return R_NilValue;
+  PROTECT(name_xp);
+  SEXP rel_xp = PROTECT(R_ExternalPtrProtected(name_xp));
+  SEXP view;
+  if (path_len == 0) {
+    view = PROTECT(mizu_zc_wrap0(shm, name_xp, rel_xp, 0));
+    mizu_zc_ref(shm);
+    mizu_zc_rel_arm((mizu_zc_rel *) R_ExternalPtrAddr(rel_xp), shm);
+  } else {
+    view = PROTECT(mizu_view_walk_path((unsigned char *) shm->addr,
+                                  (int64_t) shm->size, path, path_len,
+                                  name_xp));
+    /* a path leaf that is itself a view gets the release hook armed (a
+       serialized leaf references nothing — no count needed) */
+    if (mizu_view_check(view)) {
+      mizu_view_owned *o = (mizu_view_owned *) R_ExternalPtrAddr(R_altrep_data1(view));
+      if (o != NULL && o->release == NULL) {
+        o->release = mizu_zc_rel_fire;
+        o->release_arg = (void *) rel_xp;
+        mizu_zc_ref(shm);
+        mizu_zc_rel_arm((mizu_zc_rel *) R_ExternalPtrAddr(rel_xp), shm);
+        if (TYPEOF(view) == VECSXP) {
+          /* a list view: loan its remote leaves' regions with its record */
+          mizu_view_list *lv =
+            (mizu_view_list *) R_ExternalPtrAddr(R_altrep_data1(view));
+          mizu_zc_mizl_loans(lv->base, lv->region_size,
+                             (mizu_zc_rel *) R_ExternalPtrAddr(rel_xp));
+        }
+      }
+    }
+  }
+  UNPROTECT(3);
+  return view;
+}
+
+/* The wire-resolve release: the same sub as the prep-path finalizer, the
+   record riding the view's mizu_view_owned release slot (the layer's once-only
+   discipline fires it at materialize or finalizer — no extptr of our own
+   to anchor). The sub goes through the vendored cache's shared mapping, so
+   it relies on same-cycle GC order: if a dead view and an evicted cached
+   mapping die in one GC cycle, the view's release must run before the
+   mapping's munmap. It does by registration order — the mapping wrap is
+   registered before every view over it, and same-cycle finalizers run in
+   reverse registration order (weak-ref list, prepended at registration, run
+   head-first; de-facto but long-stable — the prep path's
+   map_wrap -> rel_xp prot chain already relies on it). */
+static void mizu_zc_wire_rel(void *arg) {
+  mizu_zc_rel_destroy((mizu_zc_rel *) arg);
+}
+
+/* One counted loan per distinct region a wrapped MIZL tree references by
+   remote leaf, hung off the view's release record. The walk's counted add
+   lands at the wrap — before the consumer-done signal — where the lazy
+   element reader's first-access add would come after it, letting the
+   producer recycle a referenced region whose claims then resolve onto new
+   data. A fresh split mapping per region (never the vendored resolve
+   cache: a loan holds no view, so the cache's same-cycle GC order
+   guarantee does not cover it). A gone or unparseable region is skipped:
+   the lazy reader raises there exactly as before. */
+struct mizl_loan_ctx {
+  mizu_zc_rel *rel;
+  char (*names)[MIZU_NAME_MAX];
+  int n, cap;
+};
+
+static void mizu_zc_mizl_loan(const char *id, int len, void *ctx) {
+  struct mizl_loan_ctx *c = (struct mizl_loan_ctx *) ctx;
+  char buf[256];
+  memcpy(buf, id, (size_t) len);
+  buf[len] = '\0';
+  char name[MIZU_NAME_MAX];
+  int32_t path[MIZU_VIEW_MAX_PATH];
+  int path_len = 0;
+  if (mizu_view_parse_id(buf, name, sizeof(name), path, &path_len) < 0)
+    return;
+  for (int i = 0; i < c->n; i++)
+    if (strcmp(c->names[i], name) == 0) return;
+  mizu_shm *loan = mizu_zc_open(name);
+  if (loan == NULL) return;
+  mizu_zc_ref(loan);
+  mizu_zc_rel *rel = c->rel;
+  if (rel->nloans == rel->loans_cap) {
+    int cap = rel->loans_cap == 0 ? 4 : 2 * rel->loans_cap;
+    mizu_shm **l = realloc(rel->loans, (size_t) cap * sizeof(mizu_shm *));
+    if (l == NULL) {         /* skip the loan: the lazy read stays correct */
+      mizu_zc_unref(loan);
+      mizu_shm_close_stack(loan, 0);
+      free(loan);
+      return;
+    }
+    rel->loans = l;
+    rel->loans_cap = cap;
+  }
+  rel->loans[rel->nloans++] = loan;
+  if (c->n == c->cap) {
+    int cap = c->cap == 0 ? 4 : 2 * c->cap;
+    char (*names)[MIZU_NAME_MAX] =
+      realloc(c->names, (size_t) cap * sizeof *names);
+    if (names == NULL) return;   /* unrecorded: a later occurrence re-loans */
+    c->names = names;
+    c->cap = cap;
+  }
+  memcpy(c->names[c->n++], name, sizeof(name));
+}
+
+struct mizl_walk_call {
+  unsigned char *base;
+  int64_t region_size;
+  struct mizl_loan_ctx *c;
+};
+
+static SEXP mizu_zc_mizl_walk_run(void *data) {
+  struct mizl_walk_call *w = (struct mizl_walk_call *) data;
+  mizu_view_mizl_remote_walk(w->base, w->region_size, mizu_zc_mizl_loan, w->c);
+  return R_NilValue;
+}
+
+static void mizu_zc_mizl_walk_cleanup(void *data, Rboolean jump) {
+  if (jump) free(((struct mizl_walk_call *) data)->c->names);
+}
+
+/* The walk validates as it goes and raises on a corrupt or newer region:
+   the dedup buffer rides an unwind cleanup so the jump cannot leak it. */
+static void mizu_zc_mizl_loans(unsigned char *base, int64_t region_size,
+                               mizu_zc_rel *rel) {
+  struct mizl_loan_ctx c = { rel, NULL, 0, 0 };
+  struct mizl_walk_call w = { base, region_size, &c };
+  SEXP cont = PROTECT(R_MakeUnwindCont());
+  R_UnwindProtect(mizu_zc_mizl_walk_run, &w, mizu_zc_mizl_walk_cleanup, &w,
+                  cont);
+  UNPROTECT(1);
+  free(c.names);
+}
+
+/* Mori's resolve hook: a view arriving via the serialize-hook path (nested
+   in a larger payload) gets the same counted protocol as the SHM_VEC / REF
+   tiers. The add lands inside R_Unserialize — before the read returns,
+   hence before the consumer-done signal, while the sender's keeper still
+   pins the payload and with it the view's own count. shm is the layer's
+   cached mapping — page 0 writable because mizu registered mizu_zc_open as
+   the open hook — so the record pins no mapping of its own; the view's
+   keeper chain holds it. */
+static void mizu_zc_wire_resolve(SEXP view, mizu_shm *shm) {
+  if (!mizu_view_check(view)) return;  /* a serialized leaf references nothing */
+  mizu_view_owned *o = (mizu_view_owned *) R_ExternalPtrAddr(R_altrep_data1(view));
+  if (o == NULL || o->release != NULL) return;
+  mizu_zc_rel *rel = malloc(sizeof(mizu_zc_rel));
+  if (rel == NULL)
+    Rf_error("mizu: allocation failure");
+  rel->shm = shm;
+  rel->pid = mizu_self_pid();
+  rel->armed = 0;
+  rel->loans = NULL;
+  rel->nloans = 0;
+  rel->loans_cap = 0;
+  o->release = mizu_zc_wire_rel;
+  o->release_arg = rel;
+  mizu_zc_ref(shm);
+  mizu_zc_rel_arm(rel, shm);
+  if (TYPEOF(view) == VECSXP) {
+    /* a list view's remote leaves count at the wrap, not at lazy access */
+    mizu_view_list *lv =
+      (mizu_view_list *) R_ExternalPtrAddr(R_altrep_data1(view));
+    mizu_zc_mizl_loans(lv->base, lv->region_size, rel);
+  }
+}
+
+// Test / debug surface --------------------------------------------------------------
+
+SEXP mizu_zc_view_check_call(SEXP x) {
+  return Rf_ScalarLogical(mizu_view_check(x));
+}
+
+/* c(refcount, flags) of the region behind a view; integer(0) for anything
+   else. Reads through the view's own chain (the refcount word is page 0,
+   mapped at least RO on every holder). */
+SEXP mizu_zc_refcount_call(SEXP x) {
+  /* the chain walk reads ALTREP slots: gate on view identity first —
+     on a plain vector data1 aliases the length field */
+  if (!mizu_view_check(x)) return Rf_allocVector(INTSXP, 0);
+  SEXP terminus = mizu_view_terminus(x);
+  mizu_shm *shm = terminus == R_NilValue ? NULL :
+    (mizu_shm *) R_ExternalPtrAddr(terminus);
+  if (shm == NULL || shm->addr == NULL) return Rf_allocVector(INTSXP, 0);
+  SEXP out = Rf_allocVector(INTSXP, 2);
+  INTEGER(out)[0] = (int) mizu_zc_refcount(shm);
+  INTEGER(out)[1] = (int) mizu_zc_flags(shm);
+  return out;
+}
+
+/* The identifier of the region behind a view — the region's own name for a
+   root view; NULL for anything else. Lets a test open the region and read
+   the layout bytes. */
+SEXP mizu_zc_view_name_call(SEXP x) {
+  if (!mizu_view_check(x)) return R_NilValue;
+  return mizu_view_shm_name(x);
+}
+
+/* Test surface: the boundary counter — region bytes armed since the last
+   boundary collection (mizu_zc_gc_boundary resets it on firing). */
+SEXP mizu_zc_armed_bytes_call(void) {
+  return Rf_ScalarReal((double) mizu_zc_armed);
+}
+
+/* The mizu.gc_boundary option's write half (.onLoad and tests): bytes as a
+   double — the 2^53 ceiling keeps the size_t conversion defined and covers
+   any sane threshold. 0 disables. */
+SEXP mizu_zc_gc_boundary_set_call(SEXP bytes) {
+  const double b = Rf_asReal(bytes);
+  if (ISNAN(b) || b < 0 || b > MIZU_DBL_SAFE_INT)
+    Rf_error(
+      "mizu: gc boundary must be a non-negative number of bytes not "
+      "exceeding 2^53");
+  mizu_zc_gc_bytes = (size_t) b;
+  return R_NilValue;
+}
+
+/* c(free-list entries, lent-ledger entries) for a handle's spill state. */
+SEXP mizu_zc_fl_info(mizu_handle *h) {
+  uint32_t fl_n, led_n;
+  mizu_handle_spill_info(h, &fl_n, &led_n);
+  SEXP out = Rf_allocVector(INTSXP, 2);
+  INTEGER(out)[0] = (int) fl_n;
+  INTEGER(out)[1] = (int) led_n;
+  return out;
+}

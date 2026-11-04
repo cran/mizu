@@ -1,0 +1,669 @@
+/* Linux kernel-wait primitive and death listener. The parker sleeps on
+   the epoch word with FUTEX_WAIT without FUTEX_PRIVATE_FLAG (cross-process
+   futexes key on the physical page). The death listener is one dormant
+   per-process thread in epoll_wait over pidfd_open descriptors
+   (kernel >= 5.3): no periodic work, asleep until a death event or
+   teardown. */
+
+/* _GNU_SOURCE: glibc hides O_CLOEXEC, MAP_POPULATE, pidfd_open, ...
+   under strict -std=c11; define before any system header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE
+#endif
+
+#include "internal.h"
+
+#ifdef __linux__
+
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <time.h>
+
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+
+// Parker -----------------------------------------------------------------------
+
+int mizu_parker_attach(mizu_parker *pk, _Atomic uint32_t *epoch,
+                      const char *region_name, int entity, int create) {
+  (void) region_name; (void) entity; (void) create;
+  pk->epoch = epoch;
+  return 0;
+}
+
+void mizu_parker_detach(mizu_parker *pk) {
+  pk->epoch = NULL;
+}
+
+int mizu_park(mizu_parker *pk, uint32_t snapshot, long timeout_ms) {
+  if (atomic_load_explicit(pk->epoch, memory_order_acquire) != snapshot)
+    return MIZU_PARK_WOKEN;
+  if (timeout_ms == 0) return MIZU_PARK_TIMEOUT;
+
+  /* Always timed: an untimed FUTEX_WAIT returns ERESTARTSYS on signal and is
+     silently restarted under SA_RESTART; only the timed wait's
+     ERESTART_RESTARTBLOCK is converted to EINTR when a handler runs. */
+  long ms = timeout_ms < 0 ? MIZU_PARK_NOMINAL_MS : timeout_ms;
+  struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+  long r = syscall(SYS_futex, (uint32_t *) pk->epoch, FUTEX_WAIT, snapshot,
+                   &ts, NULL, 0);
+  if (r == 0) return MIZU_PARK_WOKEN;
+  switch (errno) {
+  case ETIMEDOUT: return MIZU_PARK_TIMEOUT;
+  case EINTR:     return MIZU_PARK_INTR;
+  default:        return MIZU_PARK_WOKEN;    /* EAGAIN: epoch already moved */
+  }
+}
+
+void mizu_unpark(mizu_parker *pk) {
+  atomic_fetch_add_explicit(pk->epoch, 1, memory_order_release);
+  syscall(SYS_futex, (uint32_t *) pk->epoch, FUTEX_WAKE, 1, NULL, NULL, 0);
+}
+
+void mizu_unpark_all(mizu_parker *pk) {
+  atomic_fetch_add_explicit(pk->epoch, 1, memory_order_release);
+  /* the split-waiter submitter case (mizu_unpark_all's contract —
+     wait_macos.c's comment has the full form): a futex wake-all costs the
+     same as wake-one with one sleeper, but the forms stay uniform across
+     platforms */
+  syscall(SYS_futex, (uint32_t *) pk->epoch, FUTEX_WAKE, INT_MAX, NULL, NULL,
+          0);
+}
+
+// Death listener -----------------------------------------------------------------
+
+/* The epoll set holds both record kinds; data.ptr dispatches on the
+   shared first member. */
+enum { MIZU_DL_DEATH, MIZU_DL_NOTIFY };
+enum { MIZU_DW_ACTIVE, MIZU_DW_FIRED, MIZU_DW_STOPPED };
+enum { MIZU_NW_ACTIVE, MIZU_NW_STOPPED };
+
+struct mizu_death_watch_s {
+  int kind;                         /* MIZU_DL_DEATH: the event dispatch tag */
+  int pidfd;
+  int state;
+  int listed;                       /* on the registry; freed by the thread */
+  int stop_wait;                    /* a stop is waiting a callback out:
+                                       the reap holds the struct (mutex) */
+  _Atomic int in_flight;            /* cb running off-lock: stop waits it out */
+  _Atomic int *flag;
+  mizu_parker pk;
+  int has_pk;
+  void (*cb)(void *);               /* pure-C death callback (may be NULL) */
+  void *cb_arg;
+  struct mizu_death_watch_s *prev, *next;
+};
+
+/* The notify watch (notify.c's endpoint): persistent where the death
+   watch is one-shot — readability drains the endpoint socket, then fires
+   cb; no EPOLL_CTL_DEL after fire. The fd is a dup of the endpoint's, so
+   the endpoint may close while a stopped watch awaits its reap. */
+struct mizu_notify_watch_s {
+  int kind;                         /* MIZU_DL_NOTIFY */
+  int fd;
+  int state;
+  int listed;
+  int stop_wait;                    /* as the death watch's */
+  _Atomic int in_flight;            /* as the death watch's */
+  void (*cb)(void *);
+  void *cb_arg;
+  struct mizu_notify_watch_s *prev, *next;
+};
+
+static pthread_mutex_t mizu_dl_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t mizu_dl_thread;
+static int mizu_dl_running = 0;
+static int mizu_dl_thread_live = 0;    /* created and not yet joined */
+static int mizu_dl_shutdown = 0;
+static int mizu_dl_epfd = -1;
+static int mizu_dl_evfd = -1;
+static pid_t mizu_dl_pid = 0;
+static int mizu_dl_atexit_set = 0;
+static struct mizu_death_watch_s *mizu_dl_watches = NULL;
+static struct mizu_notify_watch_s *mizu_dl_nwatches = NULL;
+static int mizu_dl_reap_pending = 0;   /* a stop posted work for the reap */
+
+/* A forked child inherits the parent's bookkeeping but not its thread
+   (and possibly a mutex held at fork time): abandon everything and start
+   fresh. Registered watches are the parent's — leaked in the child by
+   design. Callers are single-threaded here (only the forking thread
+   survives fork). */
+static void mizu_dl_fork_guard(void) {
+  if (mizu_dl_pid == 0 || mizu_dl_pid == getpid()) return;
+  if (mizu_dl_epfd >= 0) close(mizu_dl_epfd);
+  if (mizu_dl_evfd >= 0) close(mizu_dl_evfd);
+  /* A watch already stopped at fork time was the parent's listener's to
+     reap: the child inherits the struct but no listener, so it is freed
+     here or never. Only STOPPED watches are touched — every stop NULLs
+     the handle's pointer, so no handle can reference one; live watches
+     stay for the handles' abandon. */
+  for (struct mizu_death_watch_s *w = mizu_dl_watches, *next; w;
+       w = next) {
+    next = w->next;
+    if (w->state == MIZU_DW_STOPPED) {
+      if (w->pidfd >= 0) close(w->pidfd);
+      free(w);
+    }
+  }
+  for (struct mizu_notify_watch_s *nw = mizu_dl_nwatches, *next; nw;
+       nw = next) {
+    next = nw->next;
+    if (nw->state == MIZU_NW_STOPPED) {
+      close(nw->fd);
+      free(nw);
+    }
+  }
+  mizu_dl_epfd = mizu_dl_evfd = -1;
+  mizu_dl_running = 0;
+  mizu_dl_thread_live = 0;   /* the parent's thread: not ours to join */
+  mizu_dl_shutdown = 0;
+  mizu_dl_watches = NULL;
+  mizu_dl_nwatches = NULL;
+  mizu_dl_reap_pending = 0;
+  mizu_dl_pid = 0;
+  pthread_mutex_init(&mizu_dl_mu, NULL);
+}
+
+static void mizu_dw_fire(struct mizu_death_watch_s *w) {
+  atomic_store_explicit(w->flag, 1, memory_order_release);
+  if (w->has_pk) mizu_unpark(&w->pk);
+  if (w->cb != NULL) w->cb(w->cb_arg);
+}
+
+static void *mizu_dl_main(void *arg) {
+  (void) arg;
+  struct epoll_event evs[16];
+  int abnormal = 0;
+  for (;;) {
+    int n = epoll_wait(mizu_dl_epfd, evs, 16, -1);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      abnormal = 1;
+      break;
+    }
+    /* Snapshot the fired watches under the lock; invoke the callbacks
+       unlocked (a callback may stop watches, and a slow callback must
+       not serialize every registration in the process). Only this
+       thread frees listed watches — in the reap, after the callbacks —
+       so a snapshot stays valid across a concurrent stop; a callback
+       landing after one is the absorbed-stale-signal case the drains
+       are built for. in_flight restores watch_stop's "no further touch
+       after return" guarantee for the unlocked invocation. */
+    void (*cbs[16])(void *);
+    void *cb_args[16];
+    _Atomic int *cb_inflight[16];
+    int *cb_state[16];
+    int cb_stopped[16];
+    int nc = 0;
+    pthread_mutex_lock(&mizu_dl_mu);
+    for (int i = 0; i < n; i++) {
+      if (evs[i].data.ptr == NULL) {          /* eventfd tick */
+        uint64_t v;
+        ssize_t r = read(mizu_dl_evfd, &v, sizeof(v));
+        (void) r;
+        continue;
+      }
+      if (*(int *) evs[i].data.ptr == MIZU_DL_NOTIFY) {
+        struct mizu_notify_watch_s *nw = evs[i].data.ptr;
+        /* drained in every state: a stopped watch's fd stays registered
+           until the stopper's wait releases the reap, and a datagram
+           left on it (level-triggered) would spin this loop meanwhile */
+        char buf[256];
+        while (recv(nw->fd, buf, sizeof(buf), 0) > 0) { }
+        if (nw->state == MIZU_NW_ACTIVE) {
+          if (nw->cb != NULL) {
+            atomic_store_explicit(&nw->in_flight, 1, memory_order_relaxed);
+            cbs[nc] = nw->cb;
+            cb_args[nc] = nw->cb_arg;
+            cb_inflight[nc] = &nw->in_flight;
+            cb_state[nc] = &nw->state;
+            cb_stopped[nc] = MIZU_NW_STOPPED;
+            nc++;
+          }
+        }
+        continue;
+      }
+      struct mizu_death_watch_s *w = evs[i].data.ptr;
+      if (w->state == MIZU_DW_ACTIVE) {
+        atomic_store_explicit(w->flag, 1, memory_order_release);
+        if (w->has_pk) mizu_unpark(&w->pk);
+        epoll_ctl(mizu_dl_epfd, EPOLL_CTL_DEL, w->pidfd, NULL);
+        close(w->pidfd);
+        w->pidfd = -1;
+        w->state = MIZU_DW_FIRED;
+        if (w->cb != NULL) {
+          atomic_store_explicit(&w->in_flight, 1, memory_order_relaxed);
+          cbs[nc] = w->cb;
+          cb_args[nc] = w->cb_arg;
+          cb_inflight[nc] = &w->in_flight;
+          cb_state[nc] = &w->state;
+          cb_stopped[nc] = MIZU_DW_STOPPED;
+          nc++;
+        }
+      }
+    }
+    pthread_mutex_unlock(&mizu_dl_mu);
+    for (int i = 0; i < nc; i++) {
+      /* a callback earlier in this batch may have stopped this watch (a
+         self-stop skips the in-flight wait, being on this thread): re-read
+         the state under the lock, so no callback runs after its stop
+         returned. The struct outlives the batch — only the reap below
+         frees listed watches. */
+      pthread_mutex_lock(&mizu_dl_mu);
+      int stopped = *cb_state[i] == cb_stopped[i];
+      pthread_mutex_unlock(&mizu_dl_mu);
+      if (!stopped) cbs[i](cb_args[i]);
+      atomic_store_explicit(cb_inflight[i], 0, memory_order_release);
+    }
+    pthread_mutex_lock(&mizu_dl_mu);
+    /* Reap stopped watches (stop posts the need; an unstopped batch
+       skips the sweeps). Only this thread frees listed watches, so an
+       event fetched in this batch can never reference an already-freed
+       one. */
+    if (mizu_dl_reap_pending) {
+      mizu_dl_reap_pending = 0;
+      for (struct mizu_death_watch_s *w = mizu_dl_watches, *next; w;
+           w = next) {
+        next = w->next;
+        if (w->state == MIZU_DW_STOPPED && !w->stop_wait) {
+          if (w->pidfd >= 0) {
+            epoll_ctl(mizu_dl_epfd, EPOLL_CTL_DEL, w->pidfd, NULL);
+            close(w->pidfd);
+          }
+          if (w->prev) w->prev->next = w->next; else mizu_dl_watches = w->next;
+          if (w->next) w->next->prev = w->prev;
+          free(w);
+        }
+      }
+      for (struct mizu_notify_watch_s *nw = mizu_dl_nwatches, *next; nw;
+           nw = next) {
+        next = nw->next;
+        if (nw->state == MIZU_NW_STOPPED && !nw->stop_wait) {
+          epoll_ctl(mizu_dl_epfd, EPOLL_CTL_DEL, nw->fd, NULL);
+          close(nw->fd);
+          if (nw->prev) nw->prev->next = nw->next;
+          else mizu_dl_nwatches = nw->next;
+          if (nw->next) nw->next->prev = nw->prev;
+          free(nw);
+        }
+      }
+    }
+    int shut = mizu_dl_shutdown;
+    pthread_mutex_unlock(&mizu_dl_mu);
+    if (shut) break;
+  }
+  if (!abnormal) return NULL;
+  /* epoll_wait failed: with the thread gone and mizu_dl_running still
+     set, every watch would register into a listener that never fires.
+     Fire all active watches conservatively (a wake trigger only — the
+     liveness lock stays the verdict), unlist them so death_watch_stop
+     frees directly, and reset the state so the next registration starts
+     a fresh listener. The thread stays joinable: mizu_dl_thread_live
+     tells the next start and the teardown to join it first (a detach
+     here would race a teardown's join). */
+  /* Fire phase: the normal loop's discipline — flag/unpark under the
+     lock, callbacks off-lock one at a time (a callback may stop watches),
+     re-walking the registry after each. A fired notify watch's closed fd
+     is its done marker. */
+  for (;;) {
+    void (*cb)(void *) = NULL;
+    void *cb_arg = NULL;
+    _Atomic int *inflight = NULL;
+    pthread_mutex_lock(&mizu_dl_mu);
+    for (struct mizu_death_watch_s *w = mizu_dl_watches; w; w = w->next) {
+      if (w->state != MIZU_DW_ACTIVE) continue;
+      atomic_store_explicit(w->flag, 1, memory_order_release);
+      if (w->has_pk) mizu_unpark(&w->pk);
+      w->state = MIZU_DW_FIRED;
+      if (w->cb != NULL) {
+        atomic_store_explicit(&w->in_flight, 1, memory_order_relaxed);
+        cb = w->cb;
+        cb_arg = w->cb_arg;
+        inflight = &w->in_flight;
+        break;
+      }
+    }
+    if (cb == NULL) {
+      for (struct mizu_notify_watch_s *nw = mizu_dl_nwatches; nw;
+           nw = nw->next) {
+        if (nw->state == MIZU_NW_ACTIVE && nw->fd >= 0 && nw->cb != NULL) {
+          close(nw->fd);
+          nw->fd = -1;
+          atomic_store_explicit(&nw->in_flight, 1, memory_order_relaxed);
+          cb = nw->cb;
+          cb_arg = nw->cb_arg;
+          inflight = &nw->in_flight;
+          break;
+        }
+      }
+    }
+    if (cb == NULL) break;   /* nothing left to fire; the lock stays held */
+    pthread_mutex_unlock(&mizu_dl_mu);
+    cb(cb_arg);                     /* conservative: a wake trigger only —
+        the drain-and-recheck absorbs a spurious fire */
+    atomic_store_explicit(inflight, 0, memory_order_release);
+  }
+  /* The sweep, still under the lock: STOPPED watches a stop is waiting
+     on stay (their tail is the stopper's — leak the struct rather than
+     free it under the wait); everything live unlists so a later stop
+     frees directly. */
+  for (struct mizu_death_watch_s *w = mizu_dl_watches, *next; w; w = next) {
+    next = w->next;
+    if (w->state == MIZU_DW_STOPPED) {
+      if (w->stop_wait) continue;
+      if (w->pidfd >= 0) close(w->pidfd);
+      free(w);
+    } else {
+      if (w->pidfd >= 0) close(w->pidfd);
+      w->pidfd = -1;
+      w->listed = 0;
+    }
+  }
+  mizu_dl_watches = NULL;
+  for (struct mizu_notify_watch_s *nw = mizu_dl_nwatches, *next; nw;
+       nw = next) {
+    next = nw->next;
+    if (nw->state == MIZU_NW_STOPPED) {
+      if (nw->stop_wait) continue;
+      if (nw->fd >= 0) close(nw->fd);
+      free(nw);
+    } else {
+      if (nw->fd >= 0) close(nw->fd);
+      nw->fd = -1;
+      nw->listed = 0;
+    }
+  }
+  mizu_dl_nwatches = NULL;
+  close(mizu_dl_epfd);
+  close(mizu_dl_evfd);
+  mizu_dl_epfd = mizu_dl_evfd = -1;
+  mizu_dl_running = 0;
+  mizu_dl_shutdown = 0;
+  pthread_mutex_unlock(&mizu_dl_mu);
+  return NULL;
+}
+
+/* Callers hold mizu_dl_mu. */
+static int mizu_dl_ensure_started(void) {
+  if (mizu_dl_running) return 0;
+  if (mizu_dl_thread_live) {
+    /* an abnormal exit left the thread unjoined; it released the lock
+       before returning, so the join cannot wait on this critical section */
+    pthread_join(mizu_dl_thread, NULL);
+    mizu_dl_thread_live = 0;
+  }
+  mizu_dl_epfd = epoll_create1(EPOLL_CLOEXEC);
+  if (mizu_dl_epfd < 0) return -1;
+  mizu_dl_evfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (mizu_dl_evfd < 0) goto fail;
+  struct epoll_event ev = {.events = EPOLLIN, .data = {.ptr = NULL}};
+  if (epoll_ctl(mizu_dl_epfd, EPOLL_CTL_ADD, mizu_dl_evfd, &ev) != 0) goto fail;
+  if (pthread_create(&mizu_dl_thread, NULL, mizu_dl_main, NULL) != 0) goto fail;
+  mizu_dl_running = 1;
+  mizu_dl_thread_live = 1;
+  mizu_dl_pid = getpid();
+  /* Join at exit(): normal shutdown never unloads the package, and a thread
+     still live at exit reports its TLS as possibly lost under valgrind.
+     Registered once per DSO lifetime; glibc runs it early on dlclose. */
+  if (!mizu_dl_atexit_set) {
+    mizu_dl_atexit_set = 1;
+    atexit(mizu_death_listener_teardown);
+  }
+  return 0;
+
+fail:
+  if (mizu_dl_epfd >= 0) close(mizu_dl_epfd);
+  if (mizu_dl_evfd >= 0) close(mizu_dl_evfd);
+  mizu_dl_epfd = mizu_dl_evfd = -1;
+  return -1;
+}
+
+/* Callers hold mizu_dl_mu: the eventfd is read under the lock, so a poke
+   never writes to a descriptor the abnormal exit closed (and the number
+   since reused). The write is non-blocking. */
+static void mizu_dl_poke(void) {
+  if (mizu_dl_evfd < 0) return;
+  uint64_t one = 1;
+  ssize_t r = write(mizu_dl_evfd, &one, sizeof(one));
+  (void) r;
+}
+
+mizu_death_watch *mizu_death_watch_start2(long pid, _Atomic int *flag,
+                                        const mizu_parker *pk,
+                                        void (*cb)(void *), void *cb_arg) {
+  mizu_dl_fork_guard();
+
+  struct mizu_death_watch_s *w = calloc(1, sizeof(*w));
+  if (w == NULL) return NULL;
+  w->kind = MIZU_DL_DEATH;
+  MIZU_DW_INIT_COMMON(w, flag, pk, cb, cb_arg);
+
+  int pidfd = (int) syscall(SYS_pidfd_open, (pid_t) pid, 0);
+  if (pidfd < 0) {
+    if (errno == ESRCH) {              /* already dead: fire immediately */
+      w->pidfd = -1;
+      w->state = MIZU_DW_FIRED;
+      mizu_dw_fire(w);
+      return w;
+    }
+    free(w);
+    return NULL;
+  }
+
+  pthread_mutex_lock(&mizu_dl_mu);
+  if (mizu_dl_ensure_started() != 0) {
+    pthread_mutex_unlock(&mizu_dl_mu);
+    close(pidfd);
+    free(w);
+    return NULL;
+  }
+  w->pidfd = pidfd;
+  w->state = MIZU_DW_ACTIVE;
+  w->listed = 1;
+  w->next = mizu_dl_watches;
+  if (mizu_dl_watches) mizu_dl_watches->prev = w;
+  mizu_dl_watches = w;
+  struct epoll_event ev = {.events = EPOLLIN, .data = {.ptr = w}};
+  if (epoll_ctl(mizu_dl_epfd, EPOLL_CTL_ADD, pidfd, &ev) != 0) {
+    if (w->next) w->next->prev = NULL;
+    mizu_dl_watches = w->next;
+    pthread_mutex_unlock(&mizu_dl_mu);
+    close(pidfd);
+    free(w);
+    return NULL;
+  }
+  pthread_mutex_unlock(&mizu_dl_mu);
+  return w;
+}
+
+/* Wait out a callback running off the listener lock, keeping stop's
+   "after return, nothing touches this watch again" guarantee — unless
+   the caller IS the callback (a self-stop would deadlock the wait; the
+   listener's reap handles the lifetime). */
+static void mizu_dl_wait_inflight(_Atomic int *in_flight) {
+  if (pthread_equal(pthread_self(), mizu_dl_thread)) return;
+  while (atomic_load_explicit(in_flight, memory_order_acquire) != 0) {
+    struct timespec ts = {0, 1000000L};
+    nanosleep(&ts, NULL);
+  }
+}
+
+void mizu_death_watch_stop(mizu_death_watch *w) {
+  mizu_dl_fork_guard();
+  /* listed and running are the listener's words (the abnormal exit
+     rewrites both under the lock): read under it, never ahead of it. The
+     mutex also synchronizes with a fire in flight: after it is released,
+     the thread never touches this watch's flag/parker again. in_flight is
+     read inside the same critical section (the callback snapshot mutates
+     it only there), so the stop knows exactly whether a callback is
+     running; stop_wait holds the reap off the struct for the whole wait —
+     the free can never race the wait loop, whose own last touch is the
+     release. */
+  pthread_mutex_lock(&mizu_dl_mu);
+  if (w->listed && mizu_dl_running) {
+    w->state = MIZU_DW_STOPPED;
+    w->stop_wait = 1;
+    mizu_dl_reap_pending = 1;
+    int inflight = atomic_load_explicit(&w->in_flight, memory_order_relaxed);
+    mizu_dl_poke();
+    pthread_mutex_unlock(&mizu_dl_mu);
+    if (inflight) mizu_dl_wait_inflight(&w->in_flight);
+    pthread_mutex_lock(&mizu_dl_mu);
+    w->stop_wait = 0;
+    mizu_dl_reap_pending = 1;
+    mizu_dl_poke();
+    pthread_mutex_unlock(&mizu_dl_mu);
+    return;
+  }
+  pthread_mutex_unlock(&mizu_dl_mu);
+  if (w->pidfd >= 0) close(w->pidfd);
+  free(w);
+}
+
+/* The fork guard has dropped the inherited registration, so the stop
+   path's listed branch can never fire here: only the child's own fd copy
+   and the struct remain. */
+void mizu_death_watch_abandon(mizu_death_watch *w) {
+  mizu_dl_fork_guard();
+  if (w->pidfd >= 0) close(w->pidfd);
+  free(w);
+}
+
+// Notify watch ----------------------------------------------------------------
+
+mizu_notify_watch *mizu_notify_watch_start(intptr_t ep_handle,
+                                         void (*cb)(void *), void *ctx) {
+  mizu_dl_fork_guard();
+
+  struct mizu_notify_watch_s *w = calloc(1, sizeof(*w));
+  if (w == NULL) return NULL;
+  w->kind = MIZU_DL_NOTIFY;
+  w->cb = cb;
+  w->cb_arg = ctx;
+  /* a dup keeps the registration valid while the endpoint closes under a
+     stopped watch's reap; CLOEXEC so spawned children hold neither */
+  w->fd = fcntl((int) ep_handle, F_DUPFD_CLOEXEC, 0);
+  if (w->fd < 0) {
+    free(w);
+    return NULL;
+  }
+
+  pthread_mutex_lock(&mizu_dl_mu);
+  if (mizu_dl_ensure_started() != 0) {
+    pthread_mutex_unlock(&mizu_dl_mu);
+    close(w->fd);
+    free(w);
+    return NULL;
+  }
+  w->state = MIZU_NW_ACTIVE;
+  w->listed = 1;
+  w->next = mizu_dl_nwatches;
+  if (mizu_dl_nwatches) mizu_dl_nwatches->prev = w;
+  mizu_dl_nwatches = w;
+  struct epoll_event ev = {.events = EPOLLIN, .data = {.ptr = w}};
+  if (epoll_ctl(mizu_dl_epfd, EPOLL_CTL_ADD, w->fd, &ev) != 0) {
+    if (w->next) w->next->prev = NULL;
+    mizu_dl_nwatches = w->next;
+    pthread_mutex_unlock(&mizu_dl_mu);
+    close(w->fd);
+    free(w);
+    return NULL;
+  }
+  pthread_mutex_unlock(&mizu_dl_mu);
+  return w;
+}
+
+void mizu_notify_watch_stop(mizu_notify_watch *w) {
+  mizu_dl_fork_guard();
+  /* as the death watch's stop: listed/running read under the lock, which
+     also synchronizes with a callback in flight; the listener reaps
+     (DELs, closes the dup, frees) after the wait's release poke */
+  pthread_mutex_lock(&mizu_dl_mu);
+  if (w->listed && mizu_dl_running) {
+    w->state = MIZU_NW_STOPPED;
+    w->stop_wait = 1;
+    mizu_dl_reap_pending = 1;
+    int inflight = atomic_load_explicit(&w->in_flight, memory_order_relaxed);
+    mizu_dl_poke();
+    pthread_mutex_unlock(&mizu_dl_mu);
+    if (inflight) mizu_dl_wait_inflight(&w->in_flight);
+    pthread_mutex_lock(&mizu_dl_mu);
+    w->stop_wait = 0;
+    mizu_dl_reap_pending = 1;
+    mizu_dl_poke();
+    pthread_mutex_unlock(&mizu_dl_mu);
+    return;
+  }
+  pthread_mutex_unlock(&mizu_dl_mu);
+  if (w->fd >= 0) close(w->fd);
+  free(w);
+}
+
+void mizu_notify_watch_abandon(mizu_notify_watch *w) {
+  mizu_dl_fork_guard();
+  if (w->fd >= 0) close(w->fd);
+  free(w);
+}
+
+void mizu_death_listener_teardown(void) {
+  mizu_dl_fork_guard();
+  pthread_mutex_lock(&mizu_dl_mu);
+  if (mizu_dl_running) {
+    mizu_dl_shutdown = 1;
+    mizu_dl_poke();
+  } else if (!mizu_dl_thread_live) {
+    pthread_mutex_unlock(&mizu_dl_mu);
+    return;
+  }
+  pthread_mutex_unlock(&mizu_dl_mu);
+  /* a live thread is joined whether it runs or exited abnormally and
+     stayed joinable (never detached, so no join can race this one) */
+  pthread_join(mizu_dl_thread, NULL);
+  mizu_dl_thread_live = 0;
+  /* Thread joined: single-threaded from here. Close per-watch fds but leave
+     the structs for their handles' finalizers, which free unlisted watches. */
+  for (struct mizu_death_watch_s *w = mizu_dl_watches, *next; w; w = next) {
+    next = w->next;
+    if (w->state == MIZU_DW_STOPPED) {
+      if (w->pidfd >= 0) close(w->pidfd);
+      free(w);
+    } else {
+      if (w->pidfd >= 0) close(w->pidfd);
+      w->pidfd = -1;
+      w->listed = 0;
+    }
+  }
+  mizu_dl_watches = NULL;
+  for (struct mizu_notify_watch_s *nw = mizu_dl_nwatches, *next; nw;
+       nw = next) {
+    next = nw->next;
+    if (nw->state == MIZU_NW_STOPPED) {
+      close(nw->fd);
+      free(nw);
+    } else {
+      close(nw->fd);
+      nw->fd = -1;
+      nw->listed = 0;
+    }
+  }
+  mizu_dl_nwatches = NULL;
+  mizu_dl_reap_pending = 0;
+  close(mizu_dl_epfd);
+  close(mizu_dl_evfd);
+  mizu_dl_epfd = mizu_dl_evfd = -1;
+  mizu_dl_running = 0;
+  mizu_dl_shutdown = 0;
+  mizu_dl_pid = 0;
+}
+
+#endif /* __linux__ */

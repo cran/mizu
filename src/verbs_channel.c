@@ -1,0 +1,523 @@
+/* The channel's .Call veneer (Part I): thin R entry points over the vendored
+   core's mizu_channel_* verbs (vendor/libmizu). Arg validation, the extptr
+   handle (a mizu_r_handle wrapping the opaque core handle), the drop's
+   MIZU_DROP_R tagging, and the mizu_status -> sentinel / classed-error mapping
+   live here; the transport (ring, arena, wakes, close rendezvous, peer-death
+   verdict) is all core-side. */
+
+#include <stdlib.h>
+#include <string.h>
+#include "mizu.h"
+
+static SEXP mizu_chan_tag;
+static SEXP mizu_class_channel;
+SEXP mizu_sent_full, mizu_sent_timeout, mizu_sent_closed, mizu_sent_gone;
+SEXP mizu_decline_python;
+
+static SEXP mizu_make_sentinel(const char *value, const char *cls) {
+  SEXP s = PROTECT(Rf_mkString(value));
+  SEXP klass = PROTECT(Rf_allocVector(STRSXP, 2));
+  SET_STRING_ELT(klass, 0, Rf_mkChar(cls));
+  SET_STRING_ELT(klass, 1, Rf_mkChar("mizu_sentinel"));
+  Rf_setAttrib(s, R_ClassSymbol, klass);
+  R_PreserveObject(s);
+  /* handed out by identity on every terminal return: an R-level mutation
+     must duplicate, never corrupt the singleton */
+#if R_VERSION >= R_Version(4, 5, 0)
+  MARK_NOT_MUTABLE(s);
+#endif
+  UNPROTECT(2);
+  return s;
+}
+
+static void mizu_chan_finalizer(SEXP xp);
+
+void mizu_channel_init(void) {
+  mizu_chan_tag = Rf_install("mizu_channel");
+  mizu_class_channel = Rf_mkString("mizu_channel");
+  R_PreserveObject(mizu_class_channel);
+  mizu_sent_full = mizu_make_sentinel("full", "mizu_full");
+  mizu_sent_timeout = mizu_make_sentinel("timeout", "mizu_timeout");
+  mizu_sent_closed = mizu_make_sentinel("closed", "mizu_closed");
+  mizu_sent_gone = mizu_make_sentinel("peer_gone", "mizu_peer_gone");
+  mizu_decline_python = PROTECT(mizu_cond_python_payload());
+  R_PreserveObject(mizu_decline_python);
+  UNPROTECT(1);
+}
+
+void mizu_channel_fini(void) {
+  R_ReleaseObject(mizu_decline_python);
+  R_ReleaseObject(mizu_sent_gone);
+  R_ReleaseObject(mizu_sent_closed);
+  R_ReleaseObject(mizu_sent_timeout);
+  R_ReleaseObject(mizu_sent_full);
+  R_ReleaseObject(mizu_class_channel);
+}
+
+// Handle access -------------------------------------------------------------------
+
+static mizu_r_handle *chan_peek(SEXP xp) {
+  return mizu_r_handle_peek(xp, mizu_chan_tag, "channel");
+}
+
+static mizu_r_handle *chan_get(SEXP xp) {
+  return mizu_r_handle_get(xp, mizu_chan_tag, "channel");
+}
+
+static mizu_channel *chan_core(SEXP xp) {
+  return (mizu_channel *) chan_get(xp)->core;
+}
+
+/* The R binding registered on every channel handle: the tier dispatch, the
+   materialize, the interrupt poll, and the pin release. exec/park/sweep are
+   NULL (a channel never evals; R has no global lock to bracket parks; no
+   per-handle cache to sweep). */
+static void chan_binding(mizu_r_handle *h, mizu_binding *b) {
+  mizu_binding_init(b);
+  b->stage = mizu_r_stage_channel;
+  b->read = mizu_r_read_channel;
+  b->check = mizu_r_check;
+  b->drop = mizu_r_drop;
+  b->ctx = h;
+  b->ident = MIZU_R_IDENT;
+}
+
+/* Build the extptr around a created/attached core handle: the prot chain
+   ([0] the zc view cache's wrap table, [1] the pin chain, [2] the decline
+   record, [3] the notify state env) and the finalizer. */
+static SEXP chan_wrap(mizu_r_handle *h) {
+  SEXP prot = PROTECT(Rf_allocVector(VECSXP, 4));
+  SET_VECTOR_ELT(prot, 0, Rf_allocVector(VECSXP, MIZU_OPEN_CACHE_MAX));
+  h->zoc.wraps = VECTOR_ELT(prot, 0);
+  h->prot = prot;
+  h->pin_slot = 1;
+  h->decline_slot = 2;
+  SEXP xp = PROTECT(R_MakeExternalPtr(h, mizu_chan_tag, prot));
+  R_RegisterCFinalizerEx(xp, mizu_chan_finalizer, TRUE);
+  Rf_setAttrib(xp, R_ClassSymbol, mizu_class_channel);
+  UNPROTECT(2);
+  return xp;
+}
+
+static void mizu_chan_finalizer(SEXP xp) {
+  mizu_r_handle *h = (mizu_r_handle *) R_ExternalPtrAddr(xp);
+  if (h == NULL) return;
+  /* the fork guard the verbs carry: a forked child that finalizes a handle
+     (a quit() runs exit finalizers) must not destroy the parent's channel —
+     the destroy would set its close bit and unlink its regions; abandon
+     releases only the child's own copies (mapping, heap) instead */
+  if (h->core != NULL) {
+    /* the notify record's watch and state refs release ahead of the destroy */
+    mizu_r_notify_teardown(h);
+    if (h->self_pid == mizu_self_pid()) {
+      /* destroy signals close and runs the non-blocking rendezvous check —
+         unlink only on the peer's bit or its confirmed death */
+      mizu_channel_destroy((mizu_channel *) h->core);
+    } else {
+      mizu_channel_abandon((mizu_channel *) h->core);
+    }
+  }
+  h->core = NULL;
+  free(h);
+  R_ClearExternalPtr(xp);
+}
+
+// Small helpers -------------------------------------------------------------------
+
+/* R-visible read of the shared clock: the map deadline R threads through
+   the pool's _try entries is computed against the same timescale the C
+   wait loops park against. */
+SEXP mizu_now_call(void) {
+  return Rf_ScalarReal(mizu_now());
+}
+
+static SEXP status_sentinel(mizu_status st) {
+  switch (st) {
+  case MIZU_FULL:      return mizu_sent_full;
+  case MIZU_CLOSED:    return mizu_sent_closed;
+  case MIZU_PEER_GONE: return mizu_sent_gone;
+  case MIZU_TIMEOUT:   return mizu_sent_timeout;
+  default:            return R_NilValue;
+  }
+}
+
+/* Raise a MIZU_ERR from a handle verb as a classed error with the handle's
+   recorded message. */
+NORET static void chan_raise(mizu_channel *c) {
+  mizu_stop("mizu_error", "mizu: %s", mizu_channel_error(c));
+}
+
+/* The recv verbs' ERR tail: a declining read hook stashes its condition on
+   the handle's decline slot and fails the read with MIZU_READ_CONSUME —
+   the slot is already consumed, so the informative error costs the
+   message, not the channel, and the core records nothing for a consumed
+   read (chan_raise would format a stale or blank record). */
+NORET static void chan_err_raise(mizu_r_handle *h, mizu_channel *c) {
+  SEXP decline = VECTOR_ELT(h->prot, h->decline_slot);
+  if (decline != R_NilValue) mizu_cond_signal(decline);   /* no return */
+  chan_raise(c);
+}
+
+/* Provenance, not class: TRUE only for the interned singletons themselves,
+   so a payload merely carrying the class never passes. */
+SEXP mizu_sentinel_check(SEXP x) {
+  return Rf_ScalarLogical(x == mizu_sent_full || x == mizu_sent_timeout ||
+                          x == mizu_sent_closed || x == mizu_sent_gone);
+}
+
+// Create (host) -------------------------------------------------------------------
+
+SEXP mizu_channel_create_call(SEXP expr, SEXP cap_sexp, SEXP slot_sexp,
+                         SEXP arena_sexp, SEXP spin) {
+  uint64_t cap = (uint64_t) mizu_r_size_arg(cap_sexp, "capacity");
+  uint64_t slot = (uint64_t) mizu_r_size_arg(slot_sexp, "slot_size");
+  double arena_in = mizu_r_size_arg(arena_sexp, "arena_size");
+  if (!mizu_r_pow2(cap) || cap < 2 || cap > (1u << 24))
+    Rf_error("mizu: capacity must be a power of two between 2 and 2^24");
+  if (!mizu_r_pow2(slot) || slot < 64 || slot > (1u << 20))
+    Rf_error("mizu: slot_size must be a power of two between 64 and 2^20");
+  if (arena_in > 1.1e12 || (uint64_t) arena_in % 128 != 0)
+    Rf_error("mizu: arena_size must be a non-negative multiple of 128");
+
+  /* the drop: the peer's bootstrap, copied into the region at create. A
+     quoted expression rides as an MIZU_DROP_R-tagged serialize stream; a
+     character scalar is UTF-8 source text in the peer's language, tagged
+     MIZU_DROP_SOURCE (the cross-language lingua franca). */
+  int source = TYPEOF(expr) == STRSXP;
+  size_t expr_size;
+  unsigned char *drop;
+  if (source) {
+    if (XLENGTH(expr) != 1 || STRING_ELT(expr, 0) == NA_STRING)
+      Rf_error("mizu: a source drop must be a single non-NA string");
+    const char *src = Rf_translateCharUTF8(STRING_ELT(expr, 0));
+    expr_size = strlen(src);
+    drop = malloc(expr_size + 1);
+    if (drop == NULL) Rf_error("mizu: allocation failure");
+    drop[0] = MIZU_DROP_SOURCE;
+    memcpy(drop + 1, src, expr_size);
+  } else {
+    expr_size = mizu_view_serialize_count(expr);
+    drop = malloc(expr_size + 1);
+    if (drop == NULL) Rf_error("mizu: allocation failure");
+    drop[0] = MIZU_DROP_R;
+    mizu_view_serialize_into(drop + 1, expr);
+  }
+
+  mizu_r_handle *h = calloc(1, sizeof(*h));
+  if (h == NULL) { free(drop); Rf_error("mizu: allocation failure"); }
+  mizu_channel_opts opts;
+  mizu_channel_opts_init(&opts);
+  opts.capacity = (uint32_t) cap;
+  opts.slot_size = (uint32_t) slot;
+  opts.arena_size = (uint64_t) arena_in;
+  opts.flags = Rf_asLogical(spin) == TRUE ? MIZU_FLAG_SPIN : 0;
+  opts.drop = drop;
+  opts.drop_size = (uint64_t) expr_size + 1;
+  mizu_binding b;
+  chan_binding(h, &b);
+
+  mizu_channel *c;
+  mizu_status st = mizu_channel_create(&c, &opts, &b);
+  free(drop);
+  if (st != MIZU_OK) {
+    free(h);
+    mizu_r_raise_tls();
+  }
+  h->core = (mizu_handle *) c;
+  h->self_pid = mizu_self_pid();
+  return chan_wrap(h);
+}
+
+SEXP mizu_channel_suffix(SEXP xp) {
+  mizu_channel *c = chan_core(xp);
+  char buf[64];
+  if (mizu_channel_token(c, buf, sizeof(buf)) != MIZU_OK)
+    chan_raise(c);
+  return Rf_mkString(buf);
+}
+
+/* Startup rendezvous: the host waits for the peer's ready word. Returns
+   FALSE on deadline expiry — the caller walks the channel back. */
+SEXP mizu_channel_ready_wait_call(SEXP xp, SEXP timeout) {
+  mizu_r_handle *h = chan_get(xp);
+  mizu_channel *c = (mizu_channel *) h->core;
+  mizu_status st = mizu_channel_ready_wait(c, mizu_timeout_ms(mizu_r_timeout_arg(timeout)));
+  if (st == MIZU_ERR) chan_raise(c);
+  if (st == MIZU_OK) {
+    /* the host learns its peer's reader before its first public send:
+       language byte and capability mask ride the handle for the stage
+       hook's foreign dispatch */
+    uint64_t ident = mizu_channel_peer_ident(c);
+    h->peer_lang = (uint32_t) (ident & 0xff);
+    h->peer_caps = (uint32_t) (ident >> 32);
+  }
+  return Rf_ScalarLogical(st == MIZU_OK);
+}
+
+/* Startup walk-back: signal close so a late-attaching peer exits instead of
+   parking against a host that gave up, then unlink everything. */
+SEXP mizu_channel_destroy_call(SEXP xp) {
+  mizu_r_handle *h = chan_get(xp);
+  mizu_r_notify_teardown(h);
+  mizu_channel_destroy((mizu_channel *) h->core);
+  h->core = NULL;
+  return R_NilValue;
+}
+
+// Attach (peer) -------------------------------------------------------------------
+
+SEXP mizu_channel_attach_call(SEXP suffix_sexp, SEXP ident_sexp) {
+  const char *suffix = mizu_r_suffix_arg(suffix_sexp);
+  /* a bad override raises — resolve it ahead of the ctx allocation */
+  const uint64_t ident = mizu_r_ident_override(ident_sexp, MIZU_R_IDENT);
+
+  mizu_r_handle *h = calloc(1, sizeof(*h));
+  if (h == NULL) Rf_error("mizu: allocation failure");
+  mizu_binding b;
+  chan_binding(h, &b);
+  b.ident = ident;
+  mizu_channel *c;
+  if (mizu_channel_attach(&c, suffix, &b) != MIZU_OK) {
+    free(h);
+    mizu_r_raise_tls();
+  }
+  h->core = (mizu_handle *) c;
+  h->self_pid = mizu_self_pid();
+  /* the peer learns the host's reader at attach */
+  uint64_t peer = mizu_channel_peer_ident(c);
+  h->peer_lang = (uint32_t) (peer & 0xff);
+  h->peer_caps = (uint32_t) (peer >> 32);
+
+  SEXP xp = PROTECT(chan_wrap(h));
+
+  /* materialize-before-ready: the host's frame keeps the expression — and
+     through the view layer's keeper chains every region its identifiers name — alive
+     exactly until ready is observed. An MIZU_DROP_R drop unserializes to
+     the expression; an MIZU_DROP_SOURCE drop is UTF-8 source text, returned
+     as a string for the caller to parse (kept opaque here so the tag
+     dispatch is explicit at both ends). */
+  const uint8_t *bytes;
+  uint64_t n;
+  mizu_channel_drop(c, &bytes, &n);
+  if (n == 0 || (bytes[0] != MIZU_DROP_R && bytes[0] != MIZU_DROP_SOURCE))
+    Rf_error("mizu: foreign channel drop (not an R bootstrap)");
+  SEXP drop = bytes[0] == MIZU_DROP_R ?
+    PROTECT(mizu_view_unserialize_from((unsigned char *) (bytes + 1),
+                                  (size_t) n - 1)) :
+    PROTECT(Rf_ScalarString(Rf_mkCharLenCE((const char *) (bytes + 1),
+                                           (int) (n - 1), CE_UTF8)));
+  SEXP out = PROTECT(Rf_allocVector(VECSXP, 2));
+  SET_VECTOR_ELT(out, 0, xp);
+  SET_VECTOR_ELT(out, 1, drop);
+  UNPROTECT(3);
+  return out;
+}
+
+SEXP mizu_channel_ready_set_call(SEXP xp) {
+  mizu_channel *c = chan_core(xp);
+  if (mizu_channel_ready_set(c) != MIZU_OK) chan_raise(c);
+  return R_NilValue;
+}
+
+// Verbs ---------------------------------------------------------------------------
+
+SEXP mizu_channel_send_call(SEXP xp, SEXP x) {
+  mizu_channel *c = chan_core(xp);
+  mizu_status st = mizu_channel_send(c, (void *) x);
+  if (st == MIZU_ERR) chan_raise(c);
+  return st == MIZU_OK ? Rf_ScalarLogical(TRUE) : status_sentinel(st);
+}
+
+/* The peer shim's uncaught-error send (peer_main's error handler): point
+   the handle's err field at the condition and send it — the stage hook
+   pointer-matches and frames the 'I' err stream INLINE in place of a
+   value, whatever the peer's language. Bounded: the ordinary send never
+   blocks for ring space, so a full ring drops the stream (the stderr line
+   still lands). The field is cleared by the hook as it matches, and here
+   on every path back, ahead of a raise that could leave it stale. */
+SEXP mizu_channel_send_error_call(SEXP xp, SEXP cond) {
+  mizu_r_handle *rh = chan_get(xp);
+  rh->err_cond = cond;
+  mizu_status st = mizu_channel_send((mizu_channel *) rh->core, (void *) cond);
+  rh->err_cond = NULL;
+  if (st == MIZU_ERR) chan_raise((mizu_channel *) rh->core);
+  return st == MIZU_OK ? Rf_ScalarLogical(TRUE) : status_sentinel(st);
+}
+
+/* One .Call; the core batches the tail store and the wake. Returns the count
+   accepted (short on ring-full or close midway — probe why with mizu_send). */
+/* The batch mode's wide scope (stage_r.c's guard): one verdict-cache
+   generation spans the element loop — the elements stay anchored by xs
+   throughout — the cleanup voiding it on the raise path too. */
+typedef struct {
+  mizu_channel *c;
+  void **objs;
+  size_t n;
+  size_t accepted;
+  mizu_status st;
+} chan_batch_s;
+
+static SEXP chan_batch_run(void *d) {
+  chan_batch_s *b = (chan_batch_s *) d;
+  b->st = mizu_channel_send_batch(b->c, b->objs, b->n, &b->accepted);
+  return R_NilValue;
+}
+
+SEXP mizu_channel_send_batch_call(SEXP xp, SEXP xs) {
+  mizu_channel *c = chan_core(xp);
+  if (TYPEOF(xs) != VECSXP)
+    Rf_error("mizu: expected a list of payloads");
+  R_xlen_t n = XLENGTH(xs);
+  void **objs = (void **) R_alloc(n, sizeof(void *));
+  for (R_xlen_t i = 0; i < n; i++)
+    objs[i] = (void *) VECTOR_ELT(xs, i);
+  chan_batch_s b = { c, objs, (size_t) n, 0, MIZU_OK };
+  mizu_stage_batch_begin();
+  R_ExecWithCleanup(chan_batch_run, &b, mizu_stage_batch_clean, NULL);
+  if (b.st == MIZU_ERR) chan_raise(c);
+  return Rf_ScalarInteger((int) b.accepted);
+}
+
+SEXP mizu_channel_recv_call(SEXP xp, SEXP timeout) {
+  mizu_r_handle *h = chan_get(xp);
+  mizu_channel *c = (mizu_channel *) h->core;
+  /* the consumer-side boundary collection and a fresh decline slot (verbs.c) */
+  mizu_r_recv_begin(h);
+  void *obj = NULL;
+  mizu_status st = mizu_channel_recv(c, &obj, mizu_timeout_ms(mizu_r_timeout_arg(timeout)));
+  if (st == MIZU_ERR) chan_err_raise(h, c);
+  if (st != MIZU_OK) return status_sentinel(st);
+  return (SEXP) obj;
+}
+
+/* Up to n messages; waits only for the first, then drains already-published
+   ones without waiting further. The sentinel discipline matches recv. The
+   sink form anchors each message in out as it is read — the array form
+   would hold n unprotected SEXPs across the remaining reads. */
+SEXP mizu_channel_recv_batch_call(SEXP xp, SEXP n_sexp, SEXP timeout) {
+  mizu_r_handle *h = chan_get(xp);
+  mizu_channel *c = (mizu_channel *) h->core;
+  int n = Rf_asInteger(n_sexp);
+  if (n < 1) Rf_error("mizu: n must be at least 1");
+  double ms = mizu_timeout_ms(mizu_r_timeout_arg(timeout));
+  /* the consumer-side boundary collection and a fresh decline slot (verbs.c) */
+  mizu_r_recv_begin(h);
+  /* the exact-size form: a non-blocking call sizes the out vector from
+     availability (only this consumer shrinks it) instead of allocating the
+     cap and shrinking — the drain's steady state */
+  if (ms == 0) {
+    size_t avail = mizu_channel_avail(c);
+    /* an empty ring falls through to the core call: it reports an orderly
+       close or peer death that an early TIMEOUT here would mask */
+    if (avail != 0 && avail < (size_t) n) n = (int) avail;
+  }
+  SEXP out = PROTECT(Rf_allocVector(VECSXP, (R_xlen_t) n));
+  size_t count = 0;
+  mizu_status st = mizu_channel_recv_batch_fn(c, (size_t) n, &count,
+                                            mizu_vec_sink, out, ms);
+  if (st == MIZU_ERR) {
+    /* keep the protect balance on the decline's signal path */
+    if (VECTOR_ELT(h->prot, h->decline_slot) != R_NilValue) UNPROTECT(1);
+    chan_err_raise(h, c);
+  }
+  if (st != MIZU_OK) {
+    UNPROTECT(1);
+    return status_sentinel(st);
+  }
+  if (count < (size_t) n) {
+    SEXP res = PROTECT(Rf_lengthgets(out, (R_xlen_t) count));
+    UNPROTECT(2);
+    return res;
+  }
+  UNPROTECT(1);
+  return out;
+}
+
+// Close protocol ------------------------------------------------------------------
+
+/* The peer half of the protocol, run by peer_main's epilogue: set our bit,
+   wake the host. No rendezvous — process exit releases everything else. */
+SEXP mizu_channel_close_signal_call(SEXP xp) {
+  mizu_r_handle *h = chan_peek(xp);
+  if (h == NULL) return R_NilValue;
+  mizu_channel_close_signal((mizu_channel *) h->core);
+  return R_NilValue;
+}
+
+SEXP mizu_channel_close_call(SEXP xp, SEXP timeout) {
+  mizu_r_handle *h = chan_peek(xp);
+  if (h == NULL) return Rf_ScalarLogical(TRUE);   /* close is idempotent */
+  mizu_channel *c = (mizu_channel *) h->core;
+  mizu_status st = mizu_channel_close(c, mizu_timeout_ms(mizu_r_timeout_arg(timeout)));
+  if (st == MIZU_ERR) chan_raise(c);
+  if (st == MIZU_OK) {
+    /* rendezvoused: the handle is dead — destroy releases it */
+    mizu_r_notify_teardown(h);
+    mizu_channel_destroy(c);
+    h->core = NULL;
+    return Rf_ScalarLogical(TRUE);
+  }
+  return Rf_ScalarLogical(FALSE);   /* MIZU_TIMEOUT: destroy retries it */
+}
+
+// Introspection -------------------------------------------------------------------
+
+/* Reports peer *process* liveness (the fd-scoped lock verdict): an orderly
+   close with the process still running is alive; a released handle is not. */
+SEXP mizu_channel_alive_call(SEXP xp) {
+  mizu_r_handle *h = chan_peek(xp);
+  if (h == NULL) return Rf_ScalarLogical(FALSE);
+  return Rf_ScalarLogical(mizu_channel_alive((mizu_channel *) h->core));
+}
+
+/* The tx-keeper count, exposed for the test suite: the keeperless and
+   reap discipline over interop traffic (1.4's acceptance). */
+SEXP mizu_channel_keep_out_call(SEXP xp) {
+  mizu_r_handle *h = chan_peek(xp);
+  if (h == NULL) return Rf_ScalarInteger(-1);
+  return Rf_ScalarInteger(
+    (int) mizu_handle_keep_out((const mizu_handle *) h->core));
+}
+
+SEXP mizu_channel_stat(SEXP xp) {
+  mizu_r_handle *h = chan_get(xp);
+  mizu_channel *c = (mizu_channel *) h->core;
+  mizu_channel_info info = { .size = sizeof(mizu_channel_info) };
+  if (mizu_channel_info_get(c, &info) != MIZU_OK) chan_raise(c);
+  const char *names[] = {"name", "side", "capacity", "slot_size",
+                         "arena_size", "inline_max", "spin", "ready",
+                         "closed", "peer_pid", "tx_sent", "tx_published",
+                         "tx_consumed", "rx_consumed", "rx_published",
+                         "fl_entries", "fl_hits", "open_hits",
+                         "open_misses", "ledger_entries", "zc_open_hits",
+                         "zc_open_misses", "notify_sends", ""};
+  SEXP out = PROTECT(Rf_mkNamed(VECSXP, names));
+  SET_VECTOR_ELT(out, 0, Rf_mkString(info.name));
+  SET_VECTOR_ELT(out, 1, Rf_mkString(info.side == MIZU_ENTITY_HOST ?
+                                     "host" : "peer"));
+  SET_VECTOR_ELT(out, 2, Rf_ScalarReal((double) info.capacity));
+  SET_VECTOR_ELT(out, 3, Rf_ScalarReal((double) info.slot_size));
+  SET_VECTOR_ELT(out, 4, Rf_ScalarReal((double) info.arena_size));
+  SET_VECTOR_ELT(out, 5, Rf_ScalarReal((double) info.inline_max));
+  SET_VECTOR_ELT(out, 6, Rf_ScalarLogical(info.spin));
+  SET_VECTOR_ELT(out, 7, Rf_ScalarLogical(info.ready));
+  SET_VECTOR_ELT(out, 8, Rf_ScalarInteger(info.closed));
+  SET_VECTOR_ELT(out, 9, Rf_ScalarReal((double) info.peer_pid));
+  SET_VECTOR_ELT(out, 10, Rf_ScalarReal((double) info.tx_sent));
+  SET_VECTOR_ELT(out, 11, Rf_ScalarReal((double) info.tx_published));
+  SET_VECTOR_ELT(out, 12, Rf_ScalarReal((double) info.tx_consumed));
+  SET_VECTOR_ELT(out, 13, Rf_ScalarReal((double) info.rx_consumed));
+  SET_VECTOR_ELT(out, 14, Rf_ScalarReal((double) info.rx_published));
+  SET_VECTOR_ELT(out, 15, Rf_ScalarInteger((int) info.fl_entries));
+  SET_VECTOR_ELT(out, 16, Rf_ScalarReal((double) info.fl_hits));
+  SET_VECTOR_ELT(out, 17, Rf_ScalarReal((double) info.open_hits));
+  SET_VECTOR_ELT(out, 18, Rf_ScalarReal((double) info.open_misses));
+  SET_VECTOR_ELT(out, 19, Rf_ScalarInteger((int) info.ledger_entries));
+  /* the zc view cache is binding-owned: the core fills 0, the R-side cache
+     patches its own counters */
+  SET_VECTOR_ELT(out, 20, Rf_ScalarReal((double) h->zoc.hits));
+  SET_VECTOR_ELT(out, 21, Rf_ScalarReal((double) h->zoc.misses));
+  SET_VECTOR_ELT(out, 22, Rf_ScalarReal((double) info.notify_sends));
+  UNPROTECT(1);
+  return out;
+}
